@@ -1,18 +1,23 @@
 name: sample
 
 on:
+  # GitHub throttles frequent schedules heavily (observed ~40 min between runs),
+  # so instead of a short job per tick, each job self-polls for ~5.5h. The cron
+  # is only a restart heartbeat: if a long job ends or dies, the next tick starts
+  # a fresh one. concurrency keeps exactly one running at a time -> continuous
+  # coverage regardless of how erratically the schedule fires.
   schedule:
-    - cron: '*/5 * * * *'      # every 5 minutes (GitHub cron minimum granularity)
-  workflow_dispatch: {}        # allow manual runs from the Actions tab
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
 
 concurrency:
   group: sample
-  cancel-in-progress: false    # never interrupt a run mid-window
+  cancel-in-progress: false    # queue behind the running job; never interrupt it
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 350         # ~5.5h; under the 6h hosted-runner cap
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,6 +27,6 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          RUN_SECONDS: '270'
+          RUN_SECONDS: '20000'   # self-poll ~5.5h per job
           PASS_INTERVAL: '30'
         run: python worker.py

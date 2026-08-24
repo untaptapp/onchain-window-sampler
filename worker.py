@@ -151,7 +151,9 @@ def detect(sources):
                  "venue": venue, "event_ts": bt, "event_slot": tx.get("slot"), "status": "pending"}],
                prefer="resolution=ignore-duplicates,return=minimal")
             print(f"[event] {label} {asset[:6]} @ {bt}", flush=True)
-        sb("POST", "/cursors?on_conflict=address", [{"address": addr, "last_sig": sigs[0]["signature"]}],
+        sb("POST", "/cursors?on_conflict=address",
+           [{"address": addr, "last_sig": sigs[0]["signature"],
+             "updated_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}],
            prefer="resolution=merge-duplicates,return=minimal")
 
 

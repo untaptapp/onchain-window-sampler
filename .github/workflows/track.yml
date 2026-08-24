@@ -24,6 +24,5 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          MAX_DAYS: '14'
           MAX_CALLS: '120'
         run: python tracker.py

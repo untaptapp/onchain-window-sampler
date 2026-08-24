@@ -1,0 +1,7 @@
+# private — never commit
+seed_sources.sql
+.env
+*.log
+__pycache__/
+*.pyc
+_setup_private.sql

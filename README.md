@@ -15,6 +15,8 @@ Actions workflow. No servers to run, no local machine required.
   internal loop lets one scheduled run cover the gap between ticks.
 - `report.py` — reads completed events and summarises the windows.
 - `schema.sql` — the four tables (`sources`, `cursors`, `events`, `samples`).
+- `tracker.py` + `.github/workflows/track.yml` — an independent slow job recording long-horizon price change per observed asset into `token_tracks` (`schema_tracks.sql`). Does not touch `events`/`samples`.
+- `trending.py` + `.github/workflows/trending.yml` — an independent poller that snapshots the fomo trending board (`/v2/leaderboard/tokens/trending`) into `trending_snapshots` (`schema_trending.sql`). The board is a live snapshot with no entry timestamp, so trending-entry events / rank velocity / board tenure are reconstructed offline by diffing snapshots. Same self-poll pattern as `sample`. Needs a third secret, `FOMOSCAN_KEY`. Does not touch `events`/`samples`.
 
 ## Setup (~10 minutes, all free)
 
@@ -27,6 +29,7 @@ Actions workflow. No servers to run, no local machine required.
 3. In the repo → **Settings → Secrets and variables → Actions**, add:
    - `SUPABASE_URL` = your project URL
    - `SUPABASE_KEY` = the service_role key
+   - `FOMOSCAN_KEY` = fomoscan API key (only needed for the `trending` workflow)
 4. **Actions** tab → enable workflows. The `sample` workflow runs every 5 minutes;
    you can also trigger it manually with **Run workflow**.
 

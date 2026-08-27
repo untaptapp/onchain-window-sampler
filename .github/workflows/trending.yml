@@ -1,0 +1,33 @@
+name: trending
+
+# Polls the fomo trending board into `trending_snapshots`. Same self-poll pattern
+# as `sample`: GitHub throttles frequent schedules, so each job self-polls for
+# ~5.5h (one board pull every PASS_INTERVAL seconds) and the cron is only a
+# restart heartbeat. concurrency keeps exactly one job running -> continuous
+# coverage regardless of how erratically the schedule fires.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: trending
+  cancel-in-progress: false    # queue behind the running job; never interrupt it
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350         # ~5.5h; under the 6h hosted-runner cap
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FOMOSCAN_KEY: ${{ secrets.FOMOSCAN_KEY }}
+          RUN_SECONDS: '20000'    # self-poll ~5.5h per job
+          PASS_INTERVAL: '900'    # one board pull every 15 min (~72k CU/mo)
+        run: python trending.py

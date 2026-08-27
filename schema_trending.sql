@@ -17,7 +17,7 @@ create table if not exists trending_snapshots (
   market_cap   double precision,
   price        double precision,
   liquidity    double precision,
-  source       text not null default 'fomoscan',  -- 'fomoscan' | 'geckoterminal' (both feeds coexist)
+  source       text not null default 'fomoscan',  -- 'fomoscan' | 'geckoterminal' | 'solanatracker' (feeds coexist)
   extra        jsonb                                -- source-specific richer fields (GeckoTerminal:
                                                     -- per-window vol + txns{buys,sells,buyers,sellers}
                                                     -- + price-change at m5/m15/m30/h1/h6/h24, pool, age)

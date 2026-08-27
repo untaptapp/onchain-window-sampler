@@ -1,0 +1,34 @@
+name: trending-st
+
+# Solana Tracker trending poller (richer/earlier momentum event source).
+# Short-window (5m) trending catches small tokens surging, which GeckoTerminal's slow
+# top board misses. Free tier is 2,500 req/mo, so we poll every 30 min (~1,440/mo).
+# Same self-poll pattern; budget-aware + fail-loud. Writes trending_snapshots
+# with source='solanatracker'. Needs the SOLANA_TRACKER_KEY secret.
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: trending-st
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SOLANA_TRACKER_KEY: ${{ secrets.SOLANA_TRACKER_KEY }}
+          RUN_SECONDS: '20000'
+          PASS_INTERVAL: '1800'   # one pull every 30 min (~1,440/mo, under the 2,500 free tier)
+          ST_TF: '5m'
+        run: python trending_st.py

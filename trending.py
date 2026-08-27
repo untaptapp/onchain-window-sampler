@@ -57,7 +57,19 @@ def sb(method, path, body=None, prefer=None):
     return 0, None
 
 
+def budget():
+    """fomoscan unitsRemaining from /v2/me (0 = quota exhausted), or None if unavailable."""
+    req = urllib.request.Request(FOMO + "/v2/me",
+        headers={"Authorization": f"Bearer {FKEY}", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return (json.loads(r.read()).get("usage") or {}).get("unitsRemaining")
+    except Exception as e:
+        print("budget check failed:", repr(e), flush=True); return None
+
+
 def fetch_board():
+    """Board dict on success, the sentinel 'QUOTA' on 402/quota-exhausted, or None on other failure."""
     req = urllib.request.Request(
         FOMO + "/v2/leaderboard/tokens/trending",
         headers={"Authorization": f"Bearer {FKEY}", "Accept": "application/json"})
@@ -66,22 +78,28 @@ def fetch_board():
             with urllib.request.urlopen(req, timeout=30) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
+            body = e.read().decode()[:200]
+            if e.code == 402 or "QUOTA_EXCEEDED" in body:
+                print(f"fomo QUOTA_EXCEEDED (402): {body}", flush=True); return "QUOTA"
             if e.code in (429, 500, 502, 503):
                 time.sleep(2 * (a + 1)); continue
-            print("fomo http", e.code, e.read()[:150], flush=True); return None
+            print("fomo http", e.code, body, flush=True); return None
         except Exception:
             time.sleep(2 * (a + 1))
     return None
 
 
 def one_pass(last_cap):
-    """Pull the board once; append rows if it is a new capture. Returns capturedAt."""
+    """Pull the board once; append rows if it is a new capture.
+    Returns (outcome, cap) where outcome in {wrote, skip, quota, fail}."""
     b = fetch_board()
+    if b == "QUOTA":
+        return "quota", last_cap
     if not b or "entries" not in b:
-        print("no board", flush=True); return last_cap
+        print("no board", flush=True); return "fail", last_cap
     cap = int(b.get("capturedAt") or int(time.time() * 1000))
     if cap == last_cap:                     # board hasn't recomputed since last pull
-        print(f"pass captured_at={cap} unchanged — skip", flush=True); return cap
+        print(f"pass captured_at={cap} unchanged — skip", flush=True); return "skip", cap
     polled = int(time.time())
     rows = []
     for e in b["entries"]:
@@ -95,23 +113,38 @@ def one_pass(last_cap):
             "price": e.get("price"), "liquidity": e.get("liquidity"),
         })
     if not rows:
-        return cap
+        return "skip", cap
     st, _ = sb("POST", "/trending_snapshots?on_conflict=mint,captured_at",
                rows, prefer="resolution=merge-duplicates,return=minimal")
     ok = st in (200, 201, 204)
     print(f"pass captured_at={cap} rows={len(rows)} write={st}{'' if ok else ' FAIL'}", flush=True)
-    return cap
+    return ("wrote" if ok else "fail"), cap
 
 
 def main():
+    # Startup budget gate — don't spin a 5.5h job against an exhausted quota.
+    rem = budget()
+    print(f"startup: fomoscan unitsRemaining={rem}", flush=True)
+    if rem == 0:
+        print("QUOTA EXHAUSTED at startup — exiting (cron re-checks cheaply; "
+              "top up the fomoscan pilot or wait for the monthly period reset).", flush=True)
+        return
     end = time.time() + RUN_SECONDS
-    last_cap = 0
-    n = 0
+    last_cap = 0; n = 0; fails = 0
     while True:
         try:
-            last_cap = one_pass(last_cap); n += 1
+            outcome, last_cap = one_pass(last_cap); n += 1
         except Exception as ex:
-            print("pass error:", repr(ex), flush=True)
+            print("pass error:", repr(ex), flush=True); outcome = "fail"
+        if outcome == "quota":
+            # Retrying is pointless until quota returns. Exit so the run COMPLETES (visible)
+            # instead of zombie-ing 'in_progress' for hours; the cron heartbeat re-checks.
+            print("QUOTA EXHAUSTED mid-run — exiting so the run status reflects it.", flush=True)
+            break
+        fails = fails + 1 if outcome == "fail" else 0
+        if fails >= 6:
+            print(f"{fails} consecutive board-fetch failures — exiting to avoid a silent zombie run.", flush=True)
+            break
         if time.time() >= end:
             break
         time.sleep(PASS_INTERVAL)

@@ -16,8 +16,15 @@ create table if not exists trending_snapshots (
   volume       double precision,            -- board's volume figure (the ranking input)
   market_cap   double precision,
   price        double precision,
-  liquidity    double precision
+  liquidity    double precision,
+  source       text not null default 'fomoscan',  -- 'fomoscan' | 'geckoterminal' (both feeds coexist)
+  extra        jsonb                                -- source-specific richer fields (GeckoTerminal:
+                                                    -- per-window vol + txns{buys,sells,buyers,sellers}
+                                                    -- + price-change at m5/m15/m30/h1/h6/h24, pool, age)
 );
+-- If the table pre-dates these columns, add them:
+-- alter table trending_snapshots add column if not exists source text not null default 'fomoscan';
+-- alter table trending_snapshots add column if not exists extra jsonb;
 
 -- One row per token per distinct board capture: makes the poller idempotent
 -- (a retried/duplicate poll for the same capturedAt is a no-op upsert).

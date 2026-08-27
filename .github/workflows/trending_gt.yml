@@ -1,0 +1,32 @@
+name: trending-gt
+
+# GeckoTerminal trending-pools poller (free substitute for the fomoscan board).
+# Same self-poll pattern as `sample`/`trending`: each job self-polls ~5.5h, the cron
+# is only a restart heartbeat, concurrency keeps one job running. GeckoTerminal is
+# free/keyless (~30 req/min) so we poll every 5 min — finer entry resolution than the
+# fomoscan board. Writes trending_snapshots with source='geckoterminal'.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: trending-gt
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          RUN_SECONDS: '20000'
+          PASS_INTERVAL: '300'    # one board pull every 5 min (free, no quota)
+        run: python trending_gt.py

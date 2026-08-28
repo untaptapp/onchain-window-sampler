@@ -45,6 +45,29 @@ def sb(method, path, body=None, prefer=None):
             time.sleep(1.5*(a+1))
     return 0, None
 
+
+def sb_all(path, page=1000, cap=200000):
+    """PostgREST caps every response at 1000 rows and truncates SILENTLY — always page."""
+    out = []
+    while len(out) < cap:
+        h = {"apikey": KEY, "Authorization": f"Bearer {KEY}",
+             "Range-Unit": "items", "Range": f"{len(out)}-{len(out) + page - 1}"}
+        try:
+            with urllib.request.urlopen(urllib.request.Request(SB + path, headers=h), timeout=90) as r:
+                t = r.read(); chunk = json.loads(t) if t else []
+        except urllib.error.HTTPError as e:
+            if e.code == 416:
+                break
+            raise
+        except Exception:
+            break
+        if not chunk:
+            break
+        out += chunk
+        if len(chunk) < page:
+            break
+    return out
+
 def price_now(asset):
     try:
         req = urllib.request.Request(
@@ -57,19 +80,17 @@ def price_now(asset):
         return None
 
 def main():
-    st, evs = sb("GET", "/events?status=eq.done&select=asset,symbol,event_ts,ref_price,id&order=event_ts.asc")
-    if st != 200 or not isinstance(evs, list):
-        print("cannot read events:", st, evs); return
+    evs = sb_all("/events?status=eq.done&select=asset,symbol,event_ts,ref_price,id&order=event_ts.asc")
+    if not evs:
+        print("cannot read events (or none done yet)"); return
     first = {}
     for e in evs:
         a = e["asset"]
         if a and a not in first and e.get("ref_price"):
             first[a] = e
-    st, tr = sb("GET", "/token_tracks?select=asset,inactive,ath_price,entry_price,n_updates,"
-                       "consecutive_nulls,last_check_ts")
-    if st != 200:
-        print("token_tracks not found — run schema_tracks.sql in Supabase.", tr); return
-    have = {t["asset"]: t for t in (tr or [])}
+    tr = sb_all("/token_tracks?select=asset,inactive,ath_price,entry_price,n_updates,"
+                "consecutive_nulls,last_check_ts")
+    have = {t["asset"]: t for t in tr}
     now = int(time.time())
 
     due = []

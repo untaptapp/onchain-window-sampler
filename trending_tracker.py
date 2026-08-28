@@ -119,11 +119,12 @@ def main():
     first = first_sightings()
     if not first:
         print("no trending mints yet", flush=True); return
-    st, tr = sb("GET", "/trending_tracks?select=mint,inactive,entry_price,ath_price,ath_mcap,"
-                       "atl_pct,n_updates,consecutive_nulls,last_check_ts")
-    if st != 200:
-        print("trending_tracks not found — run schema_trending_tracks.sql.", tr); return
-    have = {t["mint"]: t for t in (tr or [])}
+    # paginate: trending_tracks holds one row per trending mint forever, so it crosses the
+    # 1000-row PostgREST cap within days. A silent truncation would make the tracker treat
+    # already-tracked mints as new and reset their entry price.
+    tr = sb_all("/trending_tracks?select=mint,inactive,entry_price,ath_price,ath_mcap,"
+                "atl_pct,n_updates,consecutive_nulls,last_check_ts")
+    have = {t["mint"]: t for t in tr}
     now = int(time.time())
 
     due = []

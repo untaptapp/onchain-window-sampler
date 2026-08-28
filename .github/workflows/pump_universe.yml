@@ -1,0 +1,35 @@
+name: pump-universe
+
+# The pump.fun LAUNCH FIREHOSE — the population at risk for the prediction study.
+# The REST-based candidate universe failed its coverage gate (3.7-9.4% of future trenders were in
+# it beforehand). This records every pump.fun token at birth, and 84.3% of observed trending mints
+# are pump.fun tokens — so every future trender in that share passes through here before trending.
+# Free stream (subscribeNewToken + subscribeMigration); subscribeTokenTrade is NOT free.
+# Long-lived websocket, so cron is only a restart heartbeat.
+on:
+  schedule:
+    - cron: '*/45 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: pump-universe
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: deps
+        run: pip install --quiet websockets
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          RUN_SECONDS: '20000'
+          FLUSH_SEC: '30'
+        run: python pump_universe.py

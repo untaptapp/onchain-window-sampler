@@ -12,7 +12,7 @@ so the winning-subset / exit study is ALWAYS CURRENT without manual script runs:
 Reads snapshots only (never writes them). Resolution = each source's snapshot cadence (GeckoTerminal
 5-min is finest → coarser sources understate MFE). Env: SUPABASE_URL, SUPABASE_KEY.
 """
-import json, os, time, urllib.request, urllib.error, statistics as st
+import bisect, json, os, time, urllib.request, urllib.error, statistics as st
 from collections import defaultdict
 
 SB = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1"
@@ -91,6 +91,53 @@ def filters_for(source):
     return f
 
 
+# ---- SOL/USD reference ------------------------------------------------------------------
+# Every board feed stores a token's price in USD, so a raw USD return silently bundles the
+# token bet with a SOL/USD bet we never intended to take. A trade here is funded in SOL and
+# settled in SOL, so SOL-denominated P&L is the real P&L. SOL moved -2.98% across an early
+# 18.5h window (5.26% peak-to-trough) — worth ~1.8pp on median returns, i.e. roughly half the
+# median trade — and it is a systematic bias, not noise. Unlike Jupiter quotes, SOL/USD IS
+# backfillable, so we keep a reference series and carry both denominations.
+SOL_POOL = os.environ.get("SOL_POOL", "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE")  # SOL/USDC
+GT_UA = {"Accept": "application/json;version=20230302", "User-Agent": "Mozilla/5.0"}
+
+
+def refresh_sol_ref():
+    """Pull recent SOL/USD 5-min bars into sol_usd_ref (upsert), then return the full series.
+    The table accumulates beyond GeckoTerminal's ~3-day OHLCV window."""
+    try:
+        u = (f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{SOL_POOL}"
+             "/ohlcv/minute?aggregate=5&limit=1000")
+        with urllib.request.urlopen(urllib.request.Request(u, headers=GT_UA), timeout=30) as r:
+            bars = json.loads(r.read())["data"]["attributes"]["ohlcv_list"]
+        rows = [{"ts": int(b[0]), "price": float(b[4])} for b in bars if b[4]]
+        for i in range(0, len(rows), 500):
+            sb("POST", "/sol_usd_ref?on_conflict=ts", rows[i:i + 500],
+               prefer="resolution=merge-duplicates,return=minimal")
+        print(f"sol_usd_ref: refreshed {len(rows)} bars", flush=True)
+    except Exception as ex:
+        print("sol ref refresh failed (using stored):", repr(ex), flush=True)
+    got = sb("GET", "/sol_usd_ref?select=ts,price&order=ts.asc&limit=200000")[1]
+    series = [(r["ts"], r["price"]) for r in got] if isinstance(got, list) else []
+    print(f"sol_usd_ref: {len(series)} bars in table", flush=True)
+    return series
+
+
+def sol_at(series, ts):
+    """SOL/USD nearest `ts`. None if the series doesn't cover that moment — better a missing
+    conversion than one done at the wrong exchange rate."""
+    if not series:
+        return None
+    i = bisect.bisect_left(series, (ts, -1))
+    cand = []
+    if i < len(series): cand.append(series[i])
+    if i > 0: cand.append(series[i - 1])
+    if not cand:
+        return None
+    best = min(cand, key=lambda z: abs(z[0] - ts))
+    return best[1] if abs(best[0] - ts) <= 3600 else None
+
+
 QUOTE_SIZE_SOL = float(os.environ.get("QUOTE_SIZE_SOL", "1"))
 QUOTE_TOL_SEC = int(os.environ.get("QUOTE_TOL_SEC", "5400"))   # 90 min
 
@@ -121,7 +168,7 @@ def nearest_quote(quotes, mint, ts):
     return best[1] if abs(best[0] - ts) <= QUOTE_TOL_SEC else None
 
 
-def build_outcomes(source, quotes=None):
+def build_outcomes(source, quotes=None, solref=None):
     rows = sb("GET", f"/trending_snapshots?source=eq.{source}"
                      "&select=mint,captured_at,rank,price,market_cap,liquidity,extra"
                      "&order=captured_at.asc&limit=300000")[1]
@@ -164,6 +211,15 @@ def build_outcomes(source, quotes=None):
         # Quotes only exist from the moment trending_quotes.py started — history is un-costable.
         qe = nearest_quote(quotes, m, t0)
         qx = nearest_quote(quotes, m, pts[-1]["captured_at"] / 1000)
+        # SOL-denominated view: a return in SOL is the P&L actually realised by a SOL-funded
+        # trade. Derivable from any USD return as (1+r_usd) * (sol_entry/sol_exit) - 1, so we
+        # store the rate at each modelled point rather than a column per horizon.
+        se = sol_at(solref, t0)
+        sm = sol_at(solref, peak_pt["captured_at"] / 1000)
+        sl = sol_at(solref, pts[-1]["captured_at"] / 1000)
+        rec["sol_usd_entry"] = se; rec["sol_usd_mfe"] = sm; rec["sol_usd_last"] = sl
+        rec["mfe_pct_sol"] = ((1 + rec["mfe_pct"]) * (se / sm) - 1) if (se and sm) else None
+        rec["last_ret_sol"] = ((1 + rec["last_ret"]) * (se / sl) - 1) if (se and sl) else None
         rec["q_entry_imp"] = qe; rec["q_exit_imp"] = qx
         # keys must be present on EVERY row — PostgREST rejects a ragged batch
         rec["net_mfe"] = rec["net_last"] = None
@@ -179,7 +235,8 @@ def build_outcomes(source, quotes=None):
 def rollup_stats(source, outs, run_ts):
     stats = []
     hz_map = {"mfe": "mfe_pct", "1h": "ret_1h", "2h": "ret_2h", "last": "last_ret",
-              "net_mfe": "net_mfe", "net_last": "net_last"}
+              "net_mfe": "net_mfe", "net_last": "net_last",
+              "mfe_sol": "mfe_pct_sol", "last_sol": "last_ret_sol"}
     for fname, pred in filters_for(source):
         sub = [o for o in outs if pred(o)]
         for hname, col in hz_map.items():
@@ -196,10 +253,11 @@ def rollup_stats(source, outs, run_ts):
 def main():
     run_ts = int(time.time())
     quotes = load_quotes()
+    solref = refresh_sol_ref()
     print(f"loaded quotes for {len(quotes)} mints @ {QUOTE_SIZE_SOL} SOL", flush=True)
     all_stats = []
     for source in ("geckoterminal", "solanatracker", "gmgn", "fomoscan"):
-        outs = build_outcomes(source, quotes)
+        outs = build_outcomes(source, quotes, solref)
         if not outs:
             continue
         # upsert outcomes in chunks

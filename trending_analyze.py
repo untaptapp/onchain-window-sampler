@@ -40,6 +40,42 @@ def sb(method, path, body=None, prefer=None):
     return 0, None
 
 
+def sb_all(path, page=1000, cap=400000):
+    """Fetch EVERY row for `path`, paginating with Range headers.
+
+    PostgREST caps a single response at 1000 rows regardless of any `limit=` in the query, and
+    it truncates SILENTLY — a `limit=300000` returns 1000 rows with a 200 status. Combined with
+    `order=...asc` that quietly served the OLDEST 1000 rows and hid everything collected since,
+    so every rollup was computed on a stale slice of the data. Always read through this helper.
+    """
+    out = []
+    while len(out) < cap:
+        lo = len(out); hi = lo + page - 1
+        h = {"apikey": KEY, "Authorization": f"Bearer {KEY}",
+             "Range-Unit": "items", "Range": f"{lo}-{hi}"}
+        req = urllib.request.Request(SB + path, headers=h)
+        chunk = None
+        for a in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=90) as r:
+                    t = r.read(); chunk = json.loads(t) if t else []
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 416:
+                    chunk = []; break
+                if e.code in (429, 500, 502, 503):
+                    time.sleep(1.5 * (a + 1)); continue
+                chunk = []; break
+            except Exception:
+                time.sleep(1.5 * (a + 1))
+        if not chunk:
+            break
+        out += chunk
+        if len(chunk) < page:
+            break
+    return out
+
+
 def ff(x):
     try:
         return float(x)
@@ -117,8 +153,8 @@ def refresh_sol_ref():
         print(f"sol_usd_ref: refreshed {len(rows)} bars", flush=True)
     except Exception as ex:
         print("sol ref refresh failed (using stored):", repr(ex), flush=True)
-    got = sb("GET", "/sol_usd_ref?select=ts,price&order=ts.asc&limit=200000")[1]
-    series = [(r["ts"], r["price"]) for r in got] if isinstance(got, list) else []
+    got = sb_all("/sol_usd_ref?select=ts,price&order=ts.asc")
+    series = [(r["ts"], r["price"]) for r in got]
     print(f"sol_usd_ref: {len(series)} bars in table", flush=True)
     return series
 
@@ -144,11 +180,10 @@ QUOTE_TOL_SEC = int(os.environ.get("QUOTE_TOL_SEC", "5400"))   # 90 min
 
 def load_quotes():
     """mint -> sorted [(ts, price_impact_pct)] at the reference size, for point-in-time costing."""
-    rows = sb("GET", "/trending_quotes?select=mint,quoted_at,size_sol,price_impact_pct,ok"
-                     f"&size_sol=eq.{QUOTE_SIZE_SOL}&ok=is.true"
-                     "&order=quoted_at.asc&limit=200000")[1]
+    rows = sb_all("/trending_quotes?select=mint,quoted_at,size_sol,price_impact_pct,ok"
+                  f"&size_sol=eq.{QUOTE_SIZE_SOL}&ok=is.true&order=quoted_at.asc")
     q = defaultdict(list)
-    if isinstance(rows, list):
+    if True:
         for r in rows:
             if r.get("price_impact_pct") is not None:
                 q[r["mint"]].append((r["quoted_at"], r["price_impact_pct"]))
@@ -169,10 +204,10 @@ def nearest_quote(quotes, mint, ts):
 
 
 def build_outcomes(source, quotes=None, solref=None):
-    rows = sb("GET", f"/trending_snapshots?source=eq.{source}"
-                     "&select=mint,captured_at,rank,price,market_cap,liquidity,extra"
-                     "&order=captured_at.asc&limit=300000")[1]
-    if not isinstance(rows, list):
+    rows = sb_all(f"/trending_snapshots?source=eq.{source}"
+                  "&select=mint,captured_at,rank,price,market_cap,liquidity,extra"
+                  "&order=captured_at.asc")
+    if not rows:
         return []
     traj = defaultdict(list)
     for r in rows:

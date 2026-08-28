@@ -50,6 +50,42 @@ def sb(method, path, body=None, prefer=None):
     return 0, None
 
 
+def sb_all(path, page=1000, cap=400000):
+    """Fetch EVERY row for `path`, paginating with Range headers.
+
+    PostgREST caps a single response at 1000 rows regardless of any `limit=` in the query, and
+    it truncates SILENTLY — a `limit=300000` returns 1000 rows with a 200 status. Combined with
+    `order=...asc` that quietly served the OLDEST 1000 rows and hid everything collected since,
+    so every rollup was computed on a stale slice of the data. Always read through this helper.
+    """
+    out = []
+    while len(out) < cap:
+        lo = len(out); hi = lo + page - 1
+        h = {"apikey": KEY, "Authorization": f"Bearer {KEY}",
+             "Range-Unit": "items", "Range": f"{lo}-{hi}"}
+        req = urllib.request.Request(SB + path, headers=h)
+        chunk = None
+        for a in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=90) as r:
+                    t = r.read(); chunk = json.loads(t) if t else []
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 416:
+                    chunk = []; break
+                if e.code in (429, 500, 502, 503):
+                    time.sleep(1.5 * (a + 1)); continue
+                chunk = []; break
+            except Exception:
+                time.sleep(1.5 * (a + 1))
+        if not chunk:
+            break
+        out += chunk
+        if len(chunk) < page:
+            break
+    return out
+
+
 def price_mcap(mint):
     """(price_usd, mcap_usd) from GeckoTerminal, or (None, None)."""
     try:
@@ -66,8 +102,8 @@ def price_mcap(mint):
 
 def first_sightings():
     """Earliest trending sighting per mint (mint -> {ts, source, price, mcap, symbol})."""
-    rows = sb("GET", "/trending_snapshots?select=mint,captured_at,price,market_cap,handle,source"
-                     "&order=captured_at.asc&limit=200000")[1]
+    rows = sb_all("/trending_snapshots?select=mint,captured_at,price,market_cap,handle,source"
+                     "&order=captured_at.asc")
     first = {}
     if isinstance(rows, list):
         for r in rows:

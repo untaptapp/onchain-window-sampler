@@ -81,6 +81,42 @@ def sb(method, path, body=None, prefer=None):
     return 0, None
 
 
+def sb_all(path, page=1000, cap=400000):
+    """Fetch EVERY row for `path`, paginating with Range headers.
+
+    PostgREST caps a single response at 1000 rows regardless of any `limit=` in the query, and
+    it truncates SILENTLY — a `limit=300000` returns 1000 rows with a 200 status. Combined with
+    `order=...asc` that quietly served the OLDEST 1000 rows and hid everything collected since,
+    so every rollup was computed on a stale slice of the data. Always read through this helper.
+    """
+    out = []
+    while len(out) < cap:
+        lo = len(out); hi = lo + page - 1
+        h = {"apikey": KEY, "Authorization": f"Bearer {KEY}",
+             "Range-Unit": "items", "Range": f"{lo}-{hi}"}
+        req = urllib.request.Request(SB + path, headers=h)
+        chunk = None
+        for a in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=90) as r:
+                    t = r.read(); chunk = json.loads(t) if t else []
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 416:
+                    chunk = []; break
+                if e.code in (429, 500, 502, 503):
+                    time.sleep(1.5 * (a + 1)); continue
+                chunk = []; break
+            except Exception:
+                time.sleep(1.5 * (a + 1))
+        if not chunk:
+            break
+        out += chunk
+        if len(chunk) < page:
+            break
+    return out
+
+
 def sol_usd():
     """SOL price from a 1-SOL -> USDC quote; used to skip clips larger than the pool itself."""
     try:
@@ -134,11 +170,8 @@ def universe():
     """Every mint ever seen on a trending feed, with its first sighting + latest board state."""
     rows = []
     for src in ("gmgn", "solanatracker", "geckoterminal", "fomoscan"):
-        st, body = sb("GET", f"/trending_snapshots?source=eq.{src}"
-                             "&select=mint,captured_at,liquidity,price"
-                             "&order=captured_at.desc&limit=20000")
-        if isinstance(body, list):
-            rows += body
+        rows += sb_all(f"/trending_snapshots?source=eq.{src}"
+                       "&select=mint,captured_at,liquidity,price&order=captured_at.desc")
     first, latest = {}, {}
     for r in rows:
         m, t = r["mint"], r["captured_at"] / 1000.0
@@ -150,9 +183,9 @@ def universe():
 
 
 def last_quoted():
-    st, body = sb("GET", "/trending_quotes?select=mint,quoted_at&order=quoted_at.desc&limit=40000")
+    body = sb_all("/trending_quotes?select=mint,quoted_at&order=quoted_at.desc")
     out = {}
-    if isinstance(body, list):
+    if True:
         for r in body:
             m = r["mint"]
             if m not in out or r["quoted_at"] > out[m]:

@@ -231,6 +231,14 @@ def liq_at(ls, ts):
     return best[1] if best else None
 
 
+def gross_return(e, rule, solat):
+    g, xts = simulate(e["bars"], rule)
+    if g is None:
+        return None
+    a, b = solat(e["t0"]), solat(xts)
+    return ((1 + g) * (a / b) - 1) if (a and b) else g
+
+
 def net_return(e, rule, solat):
     g, xts = simulate(e["bars"], rule)
     if g is None:
@@ -264,11 +272,8 @@ def main():
     if not ents:
         print("no entries with minute bars yet — run trending_bars.py first"); return
     ents.sort(key=lambda e: e["t0"])
-    cut = ents[int(len(ents) * SPLIT)]["t0"]
     print(f"\n{len(ents)} entries with minute paths · size ${SIZE_USD:,.0f} · "
           f"SOL-denominated, net of measured cost")
-    print(f"time split at {time.strftime('%m-%d %H:%M', time.gmtime(cut))} "
-          f"(train {sum(1 for e in ents if e['t0'] < cut)} / holdout {sum(1 for e in ents if e['t0'] >= cut)})")
 
     for src in ("gmgn", "solanatracker", "geckoterminal"):
         S = [e for e in ents if e["src"] == src]
@@ -276,13 +281,14 @@ def main():
             print(f"\n=== {src}: only {len(S)} entries, skipping ==="); continue
         print(f"\n{'='*104}\n{src.upper()}  n={len(S)}\n{'='*104}")
         # --- exit-rule sweep on ALL entries (this is now measurable: intra-bar high/low) ---
-        print(f"  {'exit rule':<30} {'n':>4} {'mean':>8} {'median':>8} {'ex-top1':>9} {'win%':>6} {'P(mean<=0)':>11}")
+        print(f"  {'exit rule':<30} {'n':>4} {'GROSS':>8} {'mean':>8} {'median':>8} {'ex-top1':>9} {'win%':>6} {'P(mean<=0)':>11}")
         best = None
         for nm, rule in RULES:
             v = [x for x in (net_return(e, rule, solat) for e in S) if x is not None]
             if len(v) < 10: continue
             p = boot_p(v)
-            print(f"  {nm:<30} {len(v):>4} {st.mean(v)*100:+7.1f}% {st.median(v)*100:+7.1f}% "
+            gr = [x for x in (gross_return(e, rule, solat) for e in S) if x is not None]
+            print(f"  {nm:<30} {len(v):>4} {st.mean(gr)*100:+7.1f}% {st.mean(v)*100:+7.1f}% {st.median(v)*100:+7.1f}% "
                   f"{ex1(v)*100:+8.1f}% {sum(x>0 for x in v)/len(v)*100:5.0f}% {p if p is not None else float('nan'):11.3f}")
             if best is None or st.mean(v) > best[1]:
                 best = (nm, st.mean(v), rule)
@@ -290,13 +296,23 @@ def main():
         print(f"\n  best exit rule in-sample: {best[0]}")
         # --- filter screen, TRAIN vs HOLDOUT, with the chosen exit ---
         rule = best[2]
+        # split PER SOURCE — each feed has its own collection window, so a global cut can put
+        # an entire source on one side and silently empty the train or holdout leg
+        S.sort(key=lambda e: e["t0"])
+        # entries arrive in board-poll batches, so many share an identical t0 and the median
+        # timestamp can equal the minimum — pick the DISTINCT timestamp that splits closest to
+        # SPLIT, otherwise a whole leg silently empties
+        uniq = sorted({e["t0"] for e in S})
+        cut = min(uniq, key=lambda t: abs(sum(1 for e in S if e["t0"] < t) - len(S) * SPLIT)) if len(uniq) > 1 else uniq[0]
         tr = [e for e in S if e["t0"] < cut]; ho = [e for e in S if e["t0"] >= cut]
+        print(f"\n  time split {time.strftime('%m-%d %H:%M', time.gmtime(cut))} "
+              f"(train {len(tr)} / holdout {len(ho)})")
         print(f"\n  {'filter':<28} | {'TRAIN n':>8} {'mean':>8} {'ex1':>8} | {'HOLDOUT n':>10} {'mean':>8} {'ex1':>8} {'win%':>6}")
         rows = []
         for nm, pred in FILTERS:
             a = [x for x in (net_return(e, rule, solat) for e in tr if pred(e)) if x is not None]
             b = [x for x in (net_return(e, rule, solat) for e in ho if pred(e)) if x is not None]
-            if len(a) < 5 or len(b) < 5:
+            if len(a) < 4 or len(b) < 4:
                 continue
             rows.append((nm, a, b))
             print(f"  {nm:<28} | {len(a):>8} {st.mean(a)*100:+7.1f}% {ex1(a)*100:+7.1f}% | "

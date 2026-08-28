@@ -25,9 +25,15 @@ using w
 where w.mint = b.mint
   and (b.ts < w.t0 - 6*3600 or b.ts > w.t0 + 3*3600);
 
--- bars for mints that no longer appear in any source table
+-- Bars for mints that no longer appear in ANY source table.
+-- pump_launches MUST be in this list. Launch-sourced controls appear in no other table, so
+-- omitting it turns this from an orphan cleanup into a delete of the entire control arm. It
+-- measured as harmless (0 rows) only because no launch control had bars yet — the blast radius
+-- grows with every control we collect.
 delete from trending_bars b
 where not exists (
   select 1 from trending_snapshots s where s.mint = b.mint
   union all
-  select 1 from candidate_universe c where c.mint = b.mint);
+  select 1 from candidate_universe c where c.mint = b.mint
+  union all
+  select 1 from pump_launches p where p.mint = b.mint);

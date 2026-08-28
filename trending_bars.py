@@ -213,7 +213,11 @@ def main():
             # launches would bias the case/control comparison it exists to support.
             # Only launches 1-24h old: younger than that and GeckoTerminal has no pool/bars yet.
             now_s = time.time()
-            lo, hi = int(now_s - 24*3600), int(now_s - 3600)
+            # 6-24h, not 1-24h. GeckoTerminal indexes new pools with a LAG: a fixed cohort went
+            # from 20% indexed at 42 min to 40% at 85 min. Sampling controls at 1h therefore
+            # over-selects the early-indexed, which is exactly the traction correlation we are
+            # trying not to condition on. Waiting rides the lag curve up at no cost.
+            lo, hi = int(now_s - 24*3600), int(now_s - 6*3600)
             for r in sb_all("/pump_launches?select=mint,created_at"
                             f"&created_at=gte.{lo}&created_at=lte.{hi}&order=created_at.asc"):
                 m = r.get("mint")

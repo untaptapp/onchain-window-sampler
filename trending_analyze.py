@@ -10,13 +10,20 @@ so the winning-subset / exit study is ALWAYS CURRENT without manual script runs:
                               dropping the single best trade (the lottery-robustness check).
 
 Reads snapshots only (never writes them). Resolution = each source's snapshot cadence (GeckoTerminal
-5-min is finest → coarser sources understate MFE). Env: SUPABASE_URL, SUPABASE_KEY.
+5-min is finest → coarser sources understate MFE).
+
+Self-polls (RUN_SECONDS/PASS_INTERVAL) because GitHub throttles frequent cron — as an hourly cron
+job this was skipped for over an hour at a time, silently staling sol_usd_ref and the strategy stats.
+
+Env: SUPABASE_URL, SUPABASE_KEY, RUN_SECONDS (default 0 = one pass), PASS_INTERVAL (default 1800).
 """
 import bisect, json, os, time, urllib.request, urllib.error, statistics as st
 from collections import defaultdict
 
 SB = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1"
 KEY = os.environ["SUPABASE_KEY"]
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))
+PASS_INTERVAL = int(os.environ.get("PASS_INTERVAL", "1800"))
 HZ = {"ret_15m": 15, "ret_30m": 30, "ret_1h": 60, "ret_2h": 120, "ret_4h": 240, "ret_6h": 360}
 
 
@@ -309,5 +316,22 @@ def main():
     print(f"done · run_ts={run_ts} · {len(all_stats)} stat rows", flush=True)
 
 
+def loop():
+    """Self-poll. GitHub throttles frequent cron — an hourly job here was being skipped for over an
+    hour at a time, leaving sol_usd_ref and trending_strategy_stats stale while the pipeline looked
+    healthy. Same pattern the collectors use: long-running process, cron only as a restart heartbeat."""
+    end = time.time() + RUN_SECONDS
+    n = 0
+    while True:
+        try:
+            main(); n += 1
+        except Exception as ex:
+            print("run error:", repr(ex), flush=True)
+        if RUN_SECONDS <= 0 or time.time() >= end:
+            break
+        time.sleep(PASS_INTERVAL)
+    print(f"done {n} rollups", flush=True)
+
+
 if __name__ == "__main__":
-    main()
+    loop()

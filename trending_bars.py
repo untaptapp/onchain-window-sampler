@@ -213,10 +213,27 @@ def main():
             controls = {k: controls[k] for k in keys}
         # least-covered first, so a budgeted run always makes progress and is resumable
         todo = sorted(first.items(), key=lambda kv: have[kv[0]][2])
-        n_ctrl = int(len(todo) * UNIVERSE_FRAC / max(1e-9, 1 - UNIVERSE_FRAC)) if UNIVERSE_FRAC < 1 else len(controls)
-        ctrl_todo = [(m, t) for m, t in list(controls.items())[:max(0, n_ctrl)]]
-        todo = todo + ctrl_todo
-        print(f"  control arm: {len(controls)} eligible universe mints, {len(ctrl_todo)} queued", flush=True)
+        ctrl_todo = list(controls.items())
+        # INTERLEAVE, don't append. Concatenating controls after every case made them structurally
+        # unreachable: with hundreds of cases queued ahead of them, no finite call budget ever
+        # reached position len(cases)+1, so the control arm sat at zero bars indefinitely. Round-robin
+        # so both arms advance every pass in roughly UNIVERSE_FRAC proportion.
+        merged, ci, cj = [], 0, 0
+        step = (1 - UNIVERSE_FRAC) / UNIVERSE_FRAC if 0 < UNIVERSE_FRAC < 1 else None
+        if step is None:
+            merged = ctrl_todo if UNIVERSE_FRAC >= 1 else todo
+        else:
+            acc = 0.0
+            while ci < len(todo) or cj < len(ctrl_todo):
+                if ci < len(todo) and (acc < step or cj >= len(ctrl_todo)):
+                    merged.append(todo[ci]); ci += 1; acc += 1
+                elif cj < len(ctrl_todo):
+                    merged.append(ctrl_todo[cj]); cj += 1; acc = 0.0
+                else:
+                    break
+        todo = merged
+        print(f"  control arm: {len(controls)} eligible universe mints, {len(ctrl_todo)} interleaved "
+              f"at {UNIVERSE_FRAC:.0%} of the budget", flush=True)
         print(f"universe {len(first)} mints · {len(pools)} pools cached · "
               f"{sum(1 for m in first if have[m][2])} with bars · budget {MAX_CALLS}", flush=True)
         new_pools, new_bars, done = [], [], 0

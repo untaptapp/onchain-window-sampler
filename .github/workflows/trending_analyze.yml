@@ -1,12 +1,13 @@
 name: trending-analyze
 
-# Scheduled rollup: turns raw trending_snapshots into trending_outcomes (entry features +
+# Self-polling rollup (cron is only a restart heartbeat — GitHub throttles frequent cron, and as an
+# hourly job this was skipped for 70+ min at a time, staling sol_usd_ref and the strategy stats): turns raw trending_snapshots into trending_outcomes (entry features +
 # static-horizon returns + MFE/MAE) and trending_strategy_stats (auto-updating winning-subset
 # hunt). Makes the analysis continuous — no manual script runs. Short batch job; reads snapshots,
 # never writes them. Independent of the collectors/tracker.
 on:
   schedule:
-    - cron: '25 * * * *'
+    - cron: '25 */5 * * *'
   workflow_dispatch: {}
 
 concurrency:
@@ -16,7 +17,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,4 +27,6 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          RUN_SECONDS: '18000'
+          PASS_INTERVAL: '1800'
         run: python trending_analyze.py

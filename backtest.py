@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Minute-resolution backtest engine for the trending front-run thesis.
+
+This is the file that turns collected data into a decision. It exists because every earlier
+number had one of four defects, each of which is corrected here:
+
+  1. COARSE EXITS. Snapshot feeds sample at 5/15/30 min, so a 20% trailing stop "fired" on 6% of
+     paths and every exit statistic was a hold-return in disguise. Here every rule is simulated on
+     MINUTE bars using intra-bar HIGH and LOW — the prices a stop or take-profit actually touches.
+     Within a bar we assume the LOW is hit before the HIGH (the conservative ordering: stops fill
+     before targets), so results are pessimistic rather than flattering.
+  2. IGNORED EXECUTION COST. Returns are net of MEASURED Jupiter cost, applied per leg at the
+     liquidity prevailing AT THAT MOMENT (liquidity drains as price falls, so a loser's exit is
+     dearer than its entry).
+  3. WRONG DENOMINATION. Feeds price tokens in USD, so a raw return bundles a SOL/USD bet we never
+     took. Everything here is SOL-denominated — the P&L a SOL-funded trade actually realises.
+  4. IN-SAMPLE SELECTION. ~20 filters were screened and the best reported, with no correction. Here
+     every filter is scored on a TIME-SPLIT holdout, and the in-sample winner's holdout result is
+     reported alongside a multiple-testing adjustment, so a filter has to survive being chosen.
+
+Env: SUPABASE_URL, SUPABASE_KEY. SIZE_USD (default 500), SPLIT (default 0.5 = train fraction).
+"""
+import bisect, json, math, os, statistics as st, time, urllib.request, urllib.error
+from collections import defaultdict
+
+SB = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1"
+KEY = os.environ["SUPABASE_KEY"]
+SIZE_USD = float(os.environ.get("SIZE_USD", "500"))
+SPLIT = float(os.environ.get("SPLIT", "0.5"))
+
+
+def sb_all(path, page=1000, cap=800000):
+    out = []
+    while len(out) < cap:
+        h = {"apikey": KEY, "Authorization": f"Bearer {KEY}",
+             "Range-Unit": "items", "Range": f"{len(out)}-{len(out) + page - 1}"}
+        try:
+            with urllib.request.urlopen(urllib.request.Request(SB + path, headers=h), timeout=120) as r:
+                t = r.read(); chunk = json.loads(t) if t else []
+        except urllib.error.HTTPError as e:
+            if e.code == 416: break
+            raise
+        if not chunk: break
+        out += chunk
+        if len(chunk) < page: break
+    return out
+
+
+# ---- execution cost: measured Jupiter curve, cost% = a * size_usd^b per TVL band ----------
+BANDS = ((0, 15000), (15000, 50000), (50000, 200000), (200000, 1e6), (1e6, 9e12))
+FIT = {0: (0.112, 0.77), 1: (0.937, 0.29), 2: (0.901, 0.17), 3: (0.168, 0.22), 4: (0.039, 0.87)}
+
+
+def cost(tvl, usd=None):
+    usd = SIZE_USD if usd is None else usd
+    if not tvl or tvl <= 0:
+        return 0.50
+    i = next((k for k, (lo, hi) in enumerate(BANDS) if lo <= tvl < hi), 4)
+    a, b = FIT[i]
+    return min(a * (usd ** b), 95.0) / 100.0
+
+
+# ---- SOL/USD ------------------------------------------------------------------------------
+def load_sol():
+    s = [(r["ts"], r["price"]) for r in sb_all("/sol_usd_ref?select=ts,price&order=ts.asc")]
+    def at(ts):
+        if not s: return None
+        i = bisect.bisect_left(s, (ts, -1)); c = []
+        if i < len(s): c.append(s[i])
+        if i > 0: c.append(s[i - 1])
+        b = min(c, key=lambda z: abs(z[0] - ts))
+        return b[1] if abs(b[0] - ts) <= 3600 else None
+    return at
+
+
+# ---- exit rules: all simulated on minute bars with intra-bar high/low ----------------------
+def simulate(bars, rule):
+    """bars: [(ts,o,h,l,c)] from entry. Returns (gross_return_usd_terms, exit_ts).
+    Within a bar the LOW is assumed hit before the HIGH — stops fill before targets."""
+    if len(bars) < 2:
+        return None, None
+    p0 = bars[0][4]
+    if not p0 or p0 <= 0:
+        return None, None
+    kind = rule["kind"]
+    peak = p0
+    banked = 0.0
+    frac_left = 1.0
+    for (ts, o, h, l, c) in bars[1:]:
+        if kind == "stop_tp":
+            if l <= p0 * (1 - rule["sl"]):
+                return -rule["sl"], ts
+            if h >= p0 * (1 + rule["tp"]):
+                return rule["tp"], ts
+        elif kind == "trail":
+            w = rule["w"]
+            if l <= peak * (1 - w):
+                return max(l, peak * (1 - w)) / p0 - 1, ts
+            peak = max(peak, h)
+        elif kind == "stop_trail":
+            if l <= p0 * (1 - rule["sl"]):
+                return -rule["sl"], ts
+            if peak > p0 * (1 + rule["arm"]) and l <= peak * (1 - rule["w"]):
+                return max(l, peak * (1 - rule["w"])) / p0 - 1, ts
+            peak = max(peak, h)
+        elif kind == "partial":
+            # bank `frac` at +tp, trail the remainder; hard stop until the TP arms
+            if frac_left == 1.0 and l <= p0 * (1 - rule["sl"]):
+                return -rule["sl"], ts
+            if frac_left == 1.0 and h >= p0 * (1 + rule["tp"]):
+                banked = rule["frac"] * rule["tp"]
+                frac_left = 1 - rule["frac"]
+                peak = max(peak, p0 * (1 + rule["tp"]))
+                continue
+            if frac_left < 1.0:
+                if l <= peak * (1 - rule["w"]):
+                    return banked + frac_left * (max(l, peak * (1 - rule["w"])) / p0 - 1), ts
+                peak = max(peak, h)
+        elif kind == "time":
+            if ts - bars[0][0] >= rule["mins"] * 60:
+                return c / p0 - 1, ts
+            if rule.get("sl") and l <= p0 * (1 - rule["sl"]):
+                return -rule["sl"], ts
+    last = bars[-1]
+    r = last[4] / p0 - 1
+    if kind == "partial" and frac_left < 1.0:
+        r = banked + frac_left * r
+    return r, last[0]
+
+
+RULES = [
+    ("hold 60m",                   {"kind": "time", "mins": 60}),
+    ("hold 120m",                  {"kind": "time", "mins": 120}),
+    ("hold 120m + 30% stop",       {"kind": "time", "mins": 120, "sl": 0.30}),
+    ("stop30 / tp30",              {"kind": "stop_tp", "sl": 0.30, "tp": 0.30}),
+    ("stop30 / tp50",              {"kind": "stop_tp", "sl": 0.30, "tp": 0.50}),
+    ("stop30 / tp100",             {"kind": "stop_tp", "sl": 0.30, "tp": 1.00}),
+    ("trail 15%",                  {"kind": "trail", "w": 0.15}),
+    ("trail 30%",                  {"kind": "trail", "w": 0.30}),
+    ("trail 50%",                  {"kind": "trail", "w": 0.50}),
+    ("stop30 + trail30 armed+20",  {"kind": "stop_trail", "sl": 0.30, "w": 0.30, "arm": 0.20}),
+    ("stop30 + trail40 armed+30",  {"kind": "stop_trail", "sl": 0.30, "w": 0.40, "arm": 0.30}),
+    ("TP50%@+40, trail40, stop30", {"kind": "partial", "tp": 0.40, "frac": 0.5, "w": 0.40, "sl": 0.30}),
+    ("TP50%@+80, trail40, stop30", {"kind": "partial", "tp": 0.80, "frac": 0.5, "w": 0.40, "sl": 0.30}),
+]
+
+
+def ex1(v):
+    s = sorted(v)
+    return st.mean(s[:-1]) if len(s) > 1 else (s[0] if s else None)
+
+
+def boot_p(v, n=2000):
+    """One-sided bootstrap: P(mean <= 0). Small n and fat tails make the t-test useless here."""
+    if len(v) < 5:
+        return None
+    import random
+    random.seed(11)
+    hits = 0
+    for _ in range(n):
+        s = [v[random.randrange(len(v))] for _ in range(len(v))]
+        if st.mean(s) <= 0:
+            hits += 1
+    return hits / n
+
+
+def ff(v):
+    try: return float(v)
+    except (TypeError, ValueError): return None
+
+
+def load_entries(solat):
+    """One entry per (source, mint): board features at first sighting + minute bars after it."""
+    bars_raw = sb_all("/trending_bars?select=mint,ts,o,h,l,c&order=ts.asc")
+    bars = defaultdict(list)
+    for b in bars_raw:
+        bars[b["mint"]].append((b["ts"], b["o"], b["h"], b["l"], b["c"]))
+    for m in bars:
+        bars[m].sort()
+    print(f"bars: {len(bars_raw):,} rows across {len(bars):,} mints", flush=True)
+    ents = []
+    for src in ("gmgn", "solanatracker", "geckoterminal"):
+        rows = sb_all(f"/trending_snapshots?source=eq.{src}"
+                      "&select=mint,captured_at,rank,price,market_cap,liquidity,extra&order=captured_at.asc")
+        seen = {}
+        liqser = defaultdict(list)
+        for r in rows:
+            liqser[r["mint"]].append((r["captured_at"] / 1000, r.get("liquidity")))
+            if r["mint"] not in seen:
+                seen[r["mint"]] = r
+        for m, r in seen.items():
+            bb = bars.get(m)
+            if not bb:
+                continue
+            t0 = r["captured_at"] / 1000
+            seg = [b for b in bb if b[0] >= t0 - 60]
+            if len(seg) < 20:            # need a real path, not a stub
+                continue
+            ex = r.get("extra") or {}
+            if src == "gmgn":
+                b_, s_ = ex.get("buys"), ex.get("sells")
+                f = {"buyskew": (b_ / (b_ + s_)) if (b_ and s_ is not None and b_ + s_ > 0) else None,
+                     "p5m": ff(ex.get("price_change_percent5m")), "bundle": ff(ex.get("bundler_rate")),
+                     "rug": ff(ex.get("rug_ratio")), "smart": ff(ex.get("smart_degen_count")),
+                     "renown": ff(ex.get("renowned_count")), "top10": ff(ex.get("top_10_holder_rate"))}
+            elif src == "solanatracker":
+                pt = ex.get("pool_txns") or {}; b_, s_ = pt.get("buys"), pt.get("sells")
+                evs = ex.get("events") or {}
+                f = {"buyskew": (b_ / (b_ + s_)) if (b_ and s_ is not None and b_ + s_ > 0) else None,
+                     "p5m": ff((evs.get("5m") or {}).get("priceChangePercentage")),
+                     "bundle": None, "rug": None, "smart": None, "renown": None, "top10": None}
+            else:
+                t = (ex.get("txns") or {}).get("h1") or {}
+                b_, s_ = t.get("buys"), t.get("sells")
+                f = {"buyskew": (b_ / (b_ + s_)) if (b_ and s_ is not None and b_ + s_ > 0) else None,
+                     "p5m": ff((ex.get("pchg") or {}).get("m5")),
+                     "bundle": None, "rug": None, "smart": None, "renown": None, "top10": None}
+            ls = sorted(liqser[m])
+            ents.append({"src": src, "mint": m, "t0": t0, "bars": seg, "rank": r.get("rank"),
+                         "mcap": r.get("market_cap"), "liq": r.get("liquidity"), "liqser": ls, **f})
+    return ents
+
+
+def liq_at(ls, ts):
+    """Liquidity prevailing at a moment — the exit leg must not be priced at entry liquidity."""
+    best = None
+    for t, v in ls:
+        if v is None: continue
+        if best is None or abs(t - ts) < abs(best[0] - ts):
+            best = (t, v)
+    return best[1] if best else None
+
+
+def net_return(e, rule, solat):
+    g, xts = simulate(e["bars"], rule)
+    if g is None:
+        return None
+    a, b = solat(e["t0"]), solat(xts)
+    r = ((1 + g) * (a / b) - 1) if (a and b) else g      # SOL-denominated
+    c_in = cost(e["liq"])
+    c_out = cost(liq_at(e["liqser"], xts) or e["liq"])
+    return r - c_in - c_out
+
+
+FILTERS = [
+    ("ALL",                       lambda e: True),
+    ("buyskew>=0.6",              lambda e: (e.get("buyskew") or 0) >= 0.6),
+    ("buyskew>=0.7",              lambda e: (e.get("buyskew") or 0) >= 0.7),
+    ("liq>=$50k",                 lambda e: (e["liq"] or 0) >= 5e4),
+    ("liq>=$200k",                lambda e: (e["liq"] or 0) >= 2e5),
+    ("buyskew>=0.6 & liq>=$50k",  lambda e: (e.get("buyskew") or 0) >= 0.6 and (e["liq"] or 0) >= 5e4),
+    ("buyskew>=0.7 & liq>=$50k",  lambda e: (e.get("buyskew") or 0) >= 0.7 and (e["liq"] or 0) >= 5e4),
+    ("mcap<150k",                 lambda e: (e["mcap"] or 0) < 1.5e5),
+    ("rank>15",                   lambda e: (e["rank"] or 0) > 15),
+    ("not_spiked(p5m<=0)",        lambda e: e.get("p5m") is not None and e["p5m"] <= 0),
+    ("rug<=0.1",                  lambda e: e.get("rug") is not None and e["rug"] <= 0.1),
+    ("bundle<0.1",               lambda e: e.get("bundle") is not None and e["bundle"] < 0.1),
+]
+
+
+def main():
+    solat = load_sol()
+    ents = load_entries(solat)
+    if not ents:
+        print("no entries with minute bars yet — run trending_bars.py first"); return
+    ents.sort(key=lambda e: e["t0"])
+    cut = ents[int(len(ents) * SPLIT)]["t0"]
+    print(f"\n{len(ents)} entries with minute paths · size ${SIZE_USD:,.0f} · "
+          f"SOL-denominated, net of measured cost")
+    print(f"time split at {time.strftime('%m-%d %H:%M', time.gmtime(cut))} "
+          f"(train {sum(1 for e in ents if e['t0'] < cut)} / holdout {sum(1 for e in ents if e['t0'] >= cut)})")
+
+    for src in ("gmgn", "solanatracker", "geckoterminal"):
+        S = [e for e in ents if e["src"] == src]
+        if len(S) < 20:
+            print(f"\n=== {src}: only {len(S)} entries, skipping ==="); continue
+        print(f"\n{'='*104}\n{src.upper()}  n={len(S)}\n{'='*104}")
+        # --- exit-rule sweep on ALL entries (this is now measurable: intra-bar high/low) ---
+        print(f"  {'exit rule':<30} {'n':>4} {'mean':>8} {'median':>8} {'ex-top1':>9} {'win%':>6} {'P(mean<=0)':>11}")
+        best = None
+        for nm, rule in RULES:
+            v = [x for x in (net_return(e, rule, solat) for e in S) if x is not None]
+            if len(v) < 10: continue
+            p = boot_p(v)
+            print(f"  {nm:<30} {len(v):>4} {st.mean(v)*100:+7.1f}% {st.median(v)*100:+7.1f}% "
+                  f"{ex1(v)*100:+8.1f}% {sum(x>0 for x in v)/len(v)*100:5.0f}% {p if p is not None else float('nan'):11.3f}")
+            if best is None or st.mean(v) > best[1]:
+                best = (nm, st.mean(v), rule)
+        if not best: continue
+        print(f"\n  best exit rule in-sample: {best[0]}")
+        # --- filter screen, TRAIN vs HOLDOUT, with the chosen exit ---
+        rule = best[2]
+        tr = [e for e in S if e["t0"] < cut]; ho = [e for e in S if e["t0"] >= cut]
+        print(f"\n  {'filter':<28} | {'TRAIN n':>8} {'mean':>8} {'ex1':>8} | {'HOLDOUT n':>10} {'mean':>8} {'ex1':>8} {'win%':>6}")
+        rows = []
+        for nm, pred in FILTERS:
+            a = [x for x in (net_return(e, rule, solat) for e in tr if pred(e)) if x is not None]
+            b = [x for x in (net_return(e, rule, solat) for e in ho if pred(e)) if x is not None]
+            if len(a) < 5 or len(b) < 5:
+                continue
+            rows.append((nm, a, b))
+            print(f"  {nm:<28} | {len(a):>8} {st.mean(a)*100:+7.1f}% {ex1(a)*100:+7.1f}% | "
+                  f"{len(b):>10} {st.mean(b)*100:+7.1f}% {ex1(b)*100:+7.1f}% {sum(x>0 for x in b)/len(b)*100:5.0f}%")
+        if rows:
+            win = max(rows, key=lambda r: st.mean(r[1]))
+            k = len(rows)
+            p_raw = boot_p(win[2])
+            print(f"\n  IN-SAMPLE WINNER: {win[0]}  (train {st.mean(win[1])*100:+.1f}%)")
+            print(f"    -> HOLDOUT      : {st.mean(win[2])*100:+.1f}%  ex-top1 {ex1(win[2])*100:+.1f}%  n={len(win[2])}")
+            if p_raw is not None:
+                print(f"    -> holdout P(mean<=0) = {p_raw:.3f};  Bonferroni over {k} filters: "
+                      f"{min(1.0, p_raw*k):.3f} {'(SURVIVES)' if p_raw*k < 0.05 else '(NOT significant)'}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,34 @@
+name: trending-bars
+
+# Minute-resolution price paths — the backtest substrate.
+# Board feeds sample at 5/15/30 min, far too coarse to evaluate an exit rule (a 20% trailing stop
+# "fired" on only 6% of snapshot paths purely because a 30-min gap cannot see the drawdown).
+# Minute bars carry HIGH/LOW — the prices a stop actually touches. GeckoTerminal's OHLCV endpoint
+# is free and supports before_timestamp paging, so this BACKFILLS existing history as well as
+# extending it forward. Resumable: least-covered mints first, budgeted per run.
+on:
+  schedule:
+    - cron: '40 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: trending-bars
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          MAX_CALLS: '2400'
+          RUN_SECONDS: '18000'
+          SLEEP: '2.1'
+        run: python trending_bars.py

@@ -1,0 +1,34 @@
+name: universe
+
+# The CANDIDATE UNIVERSE — the control group for the trending-prediction study.
+# Controls must be drawn from the tokens that looked like plausible candidates at the SAME INSTANT
+# and did not trend (risk-set sampling). Comparing trending tokens against random Solana tokens is
+# invalid and would yield a ~0.99-AUC model with zero production discrimination.
+# This table also sets the recall ceiling, so it must run continuously and start before anything
+# downstream. Free + keyless (GeckoTerminal pool listings).
+on:
+  schedule:
+    - cron: '*/55 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: universe
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          PAGES: '8'
+          PASS_INTERVAL: '300'
+          RUN_SECONDS: '20000'
+        run: python universe_poller.py

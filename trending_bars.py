@@ -196,8 +196,11 @@ def main():
         # population at risk — selecting "most active controls" would bias the comparison.
         controls = {}
         if UNIVERSE_FRAC > 0:
+            # paginate the WHOLE universe: `limit=1000` is silently capped by PostgREST and covers
+            # only the last few sweeps, so the control pool collapsed to a few dozen mints drawn
+            # from one moment — not a sample of the population at risk across the study period.
             uni = sb_all("/candidate_universe?select=mint,captured_at,liquidity"
-                         "&order=captured_at.desc&limit=1000")
+                         "&order=captured_at.asc")
             seen_board = set(first)
             for r in uni:
                 m = r.get("mint")

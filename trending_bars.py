@@ -213,11 +213,14 @@ def main():
             # launches would bias the case/control comparison it exists to support.
             # Only launches 1-24h old: younger than that and GeckoTerminal has no pool/bars yet.
             now_s = time.time()
-            # 6-24h, not 1-24h. GeckoTerminal indexes new pools with a LAG: a fixed cohort went
-            # from 20% indexed at 42 min to 40% at 85 min. Sampling controls at 1h therefore
-            # over-selects the early-indexed, which is exactly the traction correlation we are
-            # trying not to condition on. Waiting rides the lag curve up at no cost.
-            lo, hi = int(now_s - 24*3600), int(now_s - 6*3600)
+            # AGE-MATCHED to the cases, which is what risk-set sampling requires. Measured from
+            # GMGN's own open_timestamp (n=1751, unbiased by our collection window), age at first
+            # trending sighting is p25 3 min / MEDIAN 10 min / p75 38.8h — 59.3% of cases trend
+            # within 15 minutes of launch. An earlier version sampled controls at 6-24h to dodge
+            # GeckoTerminal's indexing lag; that made controls 36-144x older than the median case
+            # and broke the age covariate while fixing observability. Cover the whole case range and
+            # let the analysis do the matching.
+            lo, hi = int(now_s - 24*3600), int(now_s - 5*60)
             for r in sb_all("/pump_launches?select=mint,created_at"
                             f"&created_at=gte.{lo}&created_at=lte.{hi}&order=created_at.asc"):
                 m = r.get("mint")

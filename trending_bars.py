@@ -40,7 +40,9 @@ test whether a flagged token that never trends is profitable anyway.
 Free + keyless. Reads trending_snapshots / candidate_universe, writes only trending_pools / trending_bars.
 
 Env: SUPABASE_URL, SUPABASE_KEY. MAX_CALLS (default 900), SLEEP (default 2.1 -> ~28 req/min),
-     PRE_MIN (default 30), POST_H (default 12), RUN_SECONDS (default 0 = single pass),
+     PRE_MIN (default 360 = 6h before first sighting), POST_H (default 3 — bars are the largest
+     storage cost in the project and the exit study never reads past ~2h),
+     RUN_SECONDS (default 0 = single pass),
      MIN_OBS (default 3) — a mint seen once has no path to model, so it is skipped.
 """
 import json, os, time, urllib.request, urllib.error
@@ -51,7 +53,12 @@ KEY = os.environ["SUPABASE_KEY"]
 MAX_CALLS = int(os.environ.get("MAX_CALLS", "900"))
 SLEEP = float(os.environ.get("SLEEP", "2.1"))
 PRE_MIN = int(os.environ.get("PRE_MIN", "360"))
-POST_H = float(os.environ.get("POST_H", "12"))
+# 3h, not 12h. Minute bars are the single largest storage cost in the project (425 B/row); at the
+# observed case-arrival rate, 12h of post-entry bars per mint grows the DB by ~360-1,280 MB PER DAY,
+# which blows a 500 MB budget in under a day. The exit study never reads past ~2h (MFE peaks around
+# 52 min), so the extra 9h was pure cost. PRE_MIN stays at 6h — that is the pre-trend window the
+# front-run counterfactual actually needs.
+POST_H = float(os.environ.get("POST_H", "3"))
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))
 MIN_OBS = int(os.environ.get("MIN_OBS", "3"))
 # Share of the call budget spent on CONTROL mints drawn from candidate_universe. Without this,
@@ -283,8 +290,14 @@ def main():
         for i in range(0, len(new_bars), 500):
             sb("POST", "/trending_bars?on_conflict=mint,ts", new_bars[i:i + 500],
                prefer="resolution=merge-duplicates,return=minimal")
+        # Retention, server-side. Minute bars are the largest storage cost in the project; without
+        # this the table grows by hundreds of MB/day and exhausts the 500 MB budget in under a day.
+        # Runs as an RPC so the delete happens IN the database — pulling bars client-side to filter
+        # them would burn the 5 GB monthly egress budget (one full read is already ~88 MB).
+        st, pruned = sb("POST", "/rpc/prune_trending_bars", {})
         print(f"pass done: {done} mints filled, {len(new_pools)} pools resolved, "
-              f"{calls['n']} GT calls", flush=True)
+              f"{calls['n']} GT calls, pruned {pruned if st == 200 else f'FAILED({st})'} bars",
+              flush=True)
         if not t_end or time.time() >= t_end:
             break
         calls["n"] = 0

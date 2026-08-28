@@ -27,6 +27,26 @@ Actions workflow. No servers to run, no local machine required.
 - `trending_tracker.py` + `.github/workflows/trending-track.yml` — long-horizon price/**mcap** tracker for every mint seen in `trending_snapshots` (into `trending_tracks`, `schema_trending_tracks.sql`). Keeps following tokens **after they leave the board** (where moonshots and slow rugs show up) via GeckoTerminal (free); age-tiered cadence, tracked indefinitely. Feeds long-term-winner discovery and exit-timing modelling. Does not touch the snapshot feeds.
 - `trending_gmgn.py` + `.github/workflows/trending-gmgn.yml` — **GMGN** poller (`GET /v1/market/rank`, 100 tokens/pass) into `trending_snapshots` (`source='gmgn'`). Richest board-level feed: `extra` pre-computes `is_wash_trading`, `bundler_rate`, `sniper_count`, `smart_degen_count`/`renowned_count` (smart-money & KOL holders), `rug_ratio`, `top_10_holder_rate`, buys/sells, multi-window price-change, age, `hot_level` — most of the precursor+quality feature set, free. Data auth is `X-APIKEY` only (a read-only `GMGN_KEY`; the Ed25519 signing key is swap-only, unused). Polls every 15 min; budget-aware + fail-loud.
 
+## Storage policy (Supabase free tier: 500 MB db, 5 GB egress/month)
+
+Minute bars are by far the largest cost (~425 B/row). Unbounded, at the observed case-arrival rate
+they grow the database **360–1,280 MB per day** — the whole budget in under a day. Three rules keep
+it free:
+
+1. **`POST_H` is 3h, not 12h.** The exit study never reads past ~2h (MFE peaks around 52 min).
+   `PRE_MIN` stays at 6h: that is the pre-trend window the front-run counterfactual needs.
+2. **`prune_trending_bars()` runs every pass** — a server-side RPC deleting anything outside each
+   mint's `[t0-6h, t0+3h]` window. It reclaimed 42% of the table on first run.
+3. **Filter in the database, never in the client.** One full bar-table read is ~88 MB; the 5 GB
+   monthly egress budget is only ~56 of those. Pulling rows to filter them is the expensive mistake.
+
+The retired KOL-thesis `samples` table (86 MB, 41% of the database) was exported to
+`archive/samples_export.jsonl.gz` and dropped — count-verified against the DB before deletion.
+
+**When the streaming universe lands: store aggregates, never the raw tape.** PumpPortal emits
+thousands of trades/minute; persisting that firehose would dwarf everything above. The T0 design is
+rolling counters in memory with only periodic per-mint snapshots written.
+
 ## Setup (~10 minutes, all free)
 
 1. **Supabase** → create a project (no card). In the SQL editor, run

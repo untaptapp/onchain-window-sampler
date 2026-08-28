@@ -24,6 +24,14 @@ WHAT IT DOES
 3. Prioritises mints with the LEAST coverage, so a budgeted run always makes progress and the
    job is resumable across runs.
 
+PRE_MIN defaults to 360 (6h BEFORE first sighting) on purpose. "First sighting" is not the
+trending-entry event — a mint appears on GMGN a median +106 min after the 5-min feed sees it
+(p10 -215, p90 +274), because each board has its own inclusion criteria and its own poll clock.
+Collecting deep pre-history lets us (a) locate the objective volume onset from the bars themselves
+rather than trusting any board's clock, and (b) backtest entering BEFORE the board lists a token —
+which is the actual thesis. Because GeckoTerminal OHLCV is backfillable, this needs no streaming
+infrastructure: the pre-trend counterfactual is answerable from history we can still fetch.
+
 Free + keyless. Reads trending_snapshots, writes only trending_pools / trending_bars.
 
 Env: SUPABASE_URL, SUPABASE_KEY. MAX_CALLS (default 900), SLEEP (default 2.1 -> ~28 req/min),
@@ -37,7 +45,7 @@ SB = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1"
 KEY = os.environ["SUPABASE_KEY"]
 MAX_CALLS = int(os.environ.get("MAX_CALLS", "900"))
 SLEEP = float(os.environ.get("SLEEP", "2.1"))
-PRE_MIN = int(os.environ.get("PRE_MIN", "30"))
+PRE_MIN = int(os.environ.get("PRE_MIN", "360"))
 POST_H = float(os.environ.get("POST_H", "12"))
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))
 MIN_OBS = int(os.environ.get("MIN_OBS", "3"))

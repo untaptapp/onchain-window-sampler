@@ -28,7 +28,10 @@ create table if not exists trending_snapshots (
 
 -- One row per token per distinct board capture: makes the poller idempotent
 -- (a retried/duplicate poll for the same capturedAt is a no-op upsert).
-create unique index if not exists trending_snap_uniq on trending_snapshots(mint, captured_at);
+-- `source` MUST be in the key: without it, two feeds capturing the same mint at the same
+-- captured_at collide and one silently overwrites the other, discarding that feed's `extra`
+-- feature block. Zero collisions had occurred when this was found — which is exactly when to fix it.
+create unique index if not exists trending_snap_uniq_src on trending_snapshots(mint, captured_at, source);
 -- per-token trajectory (rank/volume velocity, first-seen = entry event)
 create index if not exists trending_snap_mint_idx on trending_snapshots(mint, captured_at);
 -- whole-board scans by time

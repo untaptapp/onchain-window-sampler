@@ -114,7 +114,7 @@ def one_pass(last_cap):
         })
     if not rows:
         return "skip", cap
-    st, _ = sb("POST", "/trending_snapshots?on_conflict=mint,captured_at",
+    st, _ = sb("POST", "/trending_snapshots?on_conflict=mint,captured_at,source",
                rows, prefer="resolution=merge-duplicates,return=minimal")
     ok = st in (200, 201, 204)
     print(f"pass captured_at={cap} rows={len(rows)} write={st}{'' if ok else ' FAIL'}", flush=True)

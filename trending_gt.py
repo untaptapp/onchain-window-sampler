@@ -99,7 +99,7 @@ def one_pass():
         time.sleep(2.2)
     if not rows:
         print("no pools", flush=True); return 0
-    st, _ = sb("POST", "/trending_snapshots?on_conflict=mint,captured_at",
+    st, _ = sb("POST", "/trending_snapshots?on_conflict=mint,captured_at,source",
                rows, prefer="resolution=merge-duplicates,return=minimal")
     ok = st in (200, 201, 204)
     print(f"pass cap={cap} rows={len(rows)} write={st}{'' if ok else ' FAIL'}", flush=True)

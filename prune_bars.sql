@@ -8,6 +8,11 @@
 -- Deletes are server-side on purpose: pulling bars client-side to filter them would burn the 5 GB
 -- monthly egress budget (one full bar-table read is already ~88 MB).
 --
+-- Anchors on the UNION of a mint's events (launch, universe sighting, first AND last trending
+-- sighting), not the earliest. A mint can be a control long before it becomes a case; anchoring on
+-- min() alone closes the window post_h after the FIRST event, which for a token that launches at T
+-- and trends at T+8h deletes exactly the post-trend bars the outcome and exit analysis need.
+--
 -- Safe to re-run; it is idempotent.
 
 with t0 as (

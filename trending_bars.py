@@ -207,9 +207,22 @@ def main():
         # population at risk — selecting "most active controls" would bias the comparison.
         controls = {}
         if UNIVERSE_FRAC > 0:
+            # PRIMARY control source: the pump.fun launch firehose. candidate_universe failed its
+            # coverage gate (3.7-9.4%), while 84.3% of trending mints are pump.fun tokens, so
+            # pump_launches is the population at risk. Sampled at RANDOM — choosing the most active
+            # launches would bias the case/control comparison it exists to support.
+            # Only launches 1-24h old: younger than that and GeckoTerminal has no pool/bars yet.
+            now_s = time.time()
+            lo, hi = int(now_s - 24*3600), int(now_s - 3600)
+            for r in sb_all("/pump_launches?select=mint,created_at"
+                            f"&created_at=gte.{lo}&created_at=lte.{hi}&order=created_at.asc"):
+                m = r.get("mint")
+                if m and m not in first:
+                    controls[m] = r["created_at"]
             # paginate the WHOLE universe: `limit=1000` is silently capped by PostgREST and covers
             # only the last few sweeps, so the control pool collapsed to a few dozen mints drawn
             # from one moment — not a sample of the population at risk across the study period.
+            # secondary pool: still valid, just size-biased toward mega-caps and brand-new pools
             uni = sb_all("/candidate_universe?select=mint,captured_at,liquidity"
                          "&order=captured_at.asc")
             seen_board = set(first)

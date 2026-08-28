@@ -27,6 +27,13 @@ SB = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1"
 KEY = os.environ["SUPABASE_KEY"]
 SIZE_USD = float(os.environ.get("SIZE_USD", "500"))
 SPLIT = float(os.environ.get("SPLIT", "0.5"))
+# Max minutes between the intended entry and the first bar we actually price at. Bars have gaps
+# (an illiquid token simply doesn't trade every minute), and taking "the first bar at or after t0"
+# regardless of distance silently priced 10% of entries more than an HOUR late — worst case 10.7h.
+# A missing bar also means there was no trading, so there was no fill to be had: these are not
+# tradeable entries and must be dropped, not repriced. The drop rate is reported, since excluding
+# untradeable names is itself a survivorship choice.
+ENTRY_TOL_MIN = float(os.environ.get("ENTRY_TOL_MIN", "5"))
 
 
 def sb_all(path, page=1000, cap=800000):
@@ -43,6 +50,8 @@ def sb_all(path, page=1000, cap=800000):
         if not chunk: break
         out += chunk
         if len(chunk) < page: break
+    if len(out) >= cap:
+        print(f"!! sb_all cap reached ({cap}) for {path[:70]} — RESULT IS TRUNCATED, raise cap", flush=True)
     return out
 
 
@@ -191,6 +200,7 @@ def load_entries(solat):
         bars[m].sort()
     print(f"bars: {len(bars_raw):,} rows across {len(bars):,} mints", flush=True)
     ents = []
+    dropped = defaultdict(int)
     for src in ("gmgn", "solanatracker", "geckoterminal"):
         rows = sb_all(f"/trending_snapshots?source=eq.{src}"
                       "&select=mint,captured_at,rank,price,market_cap,liquidity,extra&order=captured_at.asc")
@@ -207,6 +217,9 @@ def load_entries(solat):
             t0 = r["captured_at"] / 1000
             seg = [b for b in bb if b[0] >= t0 - 60]
             if len(seg) < 20:            # need a real path, not a stub
+                continue
+            if (seg[0][0] - t0) / 60 > ENTRY_TOL_MIN:
+                dropped["stale_entry_bar"] += 1      # no bar near t0 => no fill was available
                 continue
             ex = r.get("extra") or {}
             if src == "gmgn":
@@ -230,6 +243,10 @@ def load_entries(solat):
             ls = sorted(liqser[m])
             ents.append({"src": src, "mint": m, "t0": t0, "bars": seg, "rank": r.get("rank"),
                          "mcap": r.get("market_cap"), "liq": r.get("liquidity"), "liqser": ls, **f})
+    if dropped:
+        tot = len(ents) + sum(dropped.values())
+        print(f"dropped {sum(dropped.values())}/{tot} entries "
+              f"({sum(dropped.values())/max(1,tot)*100:.1f}%): {dict(dropped)}", flush=True)
     return ents
 
 

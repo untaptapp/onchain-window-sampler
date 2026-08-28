@@ -114,6 +114,10 @@ def sb_all(path, page=1000, cap=400000):
         out += chunk
         if len(chunk) < page:
             break
+    if len(out) >= cap:
+        # Hitting the cap silently truncates exactly like the PostgREST 1000-row limit did.
+        # Shout rather than return a short read that looks complete.
+        print(f"!! sb_all cap reached ({cap}) for {path[:70]} — RESULT IS TRUNCATED, raise cap", flush=True)
     return out
 
 

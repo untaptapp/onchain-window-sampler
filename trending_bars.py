@@ -202,8 +202,14 @@ def main():
                 for i in range(0, len(new_bars), 500):
                     sb("POST", "/trending_bars?on_conflict=mint,ts", new_bars[i:i + 500],
                        prefer="resolution=merge-duplicates,return=minimal")
-                print(f"  .. {done} mints, {len(new_bars)} bars flushed, {calls['n']} calls", flush=True)
-                new_bars = []
+                # flush pools on the SAME cadence — writing them only at end-of-pass meant an
+                # interrupted run lost every resolution and re-paid for it on the next pass
+                for i in range(0, len(new_pools), 500):
+                    sb("POST", "/trending_pools?on_conflict=mint", new_pools[i:i + 500],
+                       prefer="resolution=merge-duplicates,return=minimal")
+                print(f"  .. {done} mints, {len(new_bars)} bars + {len(new_pools)} pools flushed, "
+                      f"{calls['n']} calls", flush=True)
+                new_bars, new_pools = [], []
         for i in range(0, len(new_pools), 500):
             sb("POST", "/trending_pools?on_conflict=mint", new_pools[i:i + 500],
                prefer="resolution=merge-duplicates,return=minimal")

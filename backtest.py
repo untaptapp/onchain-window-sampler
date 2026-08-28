@@ -150,6 +150,18 @@ def ex1(v):
     return st.mean(s[:-1]) if len(s) > 1 else (s[0] if s else None)
 
 
+def geo(v, f):
+    """Per-trade geometric (compounded) growth at fixed fraction f of bankroll."""
+    if not v:
+        return 0.0
+    g = 0.0
+    for x in v:
+        if 1 + f * x <= 1e-9:
+            return -1.0
+        g += math.log(1 + f * x)
+    return math.exp(g / len(v)) - 1
+
+
 def boot_p(v, n=2000):
     """One-sided bootstrap: P(mean <= 0). Small n and fat tails make the t-test useless here."""
     if len(v) < 5:
@@ -269,6 +281,16 @@ FILTERS = [
 def main():
     solat = load_sol()
     ents = load_entries(solat)
+    if os.environ.get("DEDUP", "1") == "1":
+        by = {}
+        for e in ents:
+            if e["mint"] not in by or e["t0"] < by[e["mint"]]["t0"]:
+                by[e["mint"]] = e
+        if len(by) < len(ents):
+            print(f"dedup: {len(ents)} feed-entries -> {len(by)} unique mints "
+                  f"({len(ents)-len(by)} duplicate observations of the same token dropped); "
+                  f"a mint is attributed to the feed that saw it FIRST")
+        ents = list(by.values())
     if not ents:
         print("no entries with minute bars yet — run trending_bars.py first"); return
     ents.sort(key=lambda e: e["t0"])
@@ -280,33 +302,36 @@ def main():
         if len(S) < 20:
             print(f"\n=== {src}: only {len(S)} entries, skipping ==="); continue
         print(f"\n{'='*104}\n{src.upper()}  n={len(S)}\n{'='*104}")
-        # --- exit-rule sweep on ALL entries (this is now measurable: intra-bar high/low) ---
-        print(f"  {'exit rule':<30} {'n':>4} {'GROSS':>8} {'mean':>8} {'median':>8} {'ex-top1':>9} {'win%':>6} {'P(mean<=0)':>11}")
+        # split FIRST: the exit rule must be chosen without the holdout in scope, or the
+        # "out-of-sample" number is contaminated by the selection that produced it
+        S.sort(key=lambda e: e["t0"])
+        uniq = sorted({e["t0"] for e in S})
+        cut = (min(uniq, key=lambda t: abs(sum(1 for e in S if e["t0"] < t) - len(S) * SPLIT))
+               if len(uniq) > 1 else uniq[0])
+        TR = [e for e in S if e["t0"] < cut]; HO = [e for e in S if e["t0"] >= cut]
+        print(f"  time split {time.strftime('%m-%d %H:%M', time.gmtime(cut))} "
+              f"(train {len(TR)} / holdout {len(HO)})")
+        # --- exit-rule sweep, reported on TRAIN (selection set) ---
+        print(f"  {'exit rule':<30} {'n':>4} {'GROSS':>8} {'mean':>8} {'median':>8} {'geo@10%':>9} {'win%':>6} {'P(mean<=0)':>11}")
         best = None
         for nm, rule in RULES:
-            v = [x for x in (net_return(e, rule, solat) for e in S) if x is not None]
+            v = [x for x in (net_return(e, rule, solat) for e in TR) if x is not None]
             if len(v) < 10: continue
             p = boot_p(v)
-            gr = [x for x in (gross_return(e, rule, solat) for e in S) if x is not None]
+            gr = [x for x in (gross_return(e, rule, solat) for e in TR) if x is not None]
             print(f"  {nm:<30} {len(v):>4} {st.mean(gr)*100:+7.1f}% {st.mean(v)*100:+7.1f}% {st.median(v)*100:+7.1f}% "
-                  f"{ex1(v)*100:+8.1f}% {sum(x>0 for x in v)/len(v)*100:5.0f}% {p if p is not None else float('nan'):11.3f}")
+                  f"{geo(v,0.10)*100:+8.2f}% {sum(x>0 for x in v)/len(v)*100:5.0f}% {p if p is not None else float('nan'):11.3f}")
             if best is None or st.mean(v) > best[1]:
                 best = (nm, st.mean(v), rule)
         if not best: continue
-        print(f"\n  best exit rule in-sample: {best[0]}")
+        print(f"\n  best exit rule ON TRAIN: {best[0]}  -> now applied unchanged to the holdout")
+        vho = [x for x in (net_return(e, best[2], solat) for e in HO) if x is not None]
+        if len(vho) >= 5:
+            print(f"    holdout with that rule: mean {st.mean(vho)*100:+.1f}%  median {st.median(vho)*100:+.1f}%  "
+                  f"win {sum(x>0 for x in vho)/len(vho)*100:.0f}%  geo@f=10% {geo(vho,0.10)*100:+.2f}%/trade")
         # --- filter screen, TRAIN vs HOLDOUT, with the chosen exit ---
         rule = best[2]
-        # split PER SOURCE — each feed has its own collection window, so a global cut can put
-        # an entire source on one side and silently empty the train or holdout leg
-        S.sort(key=lambda e: e["t0"])
-        # entries arrive in board-poll batches, so many share an identical t0 and the median
-        # timestamp can equal the minimum — pick the DISTINCT timestamp that splits closest to
-        # SPLIT, otherwise a whole leg silently empties
-        uniq = sorted({e["t0"] for e in S})
-        cut = min(uniq, key=lambda t: abs(sum(1 for e in S if e["t0"] < t) - len(S) * SPLIT)) if len(uniq) > 1 else uniq[0]
-        tr = [e for e in S if e["t0"] < cut]; ho = [e for e in S if e["t0"] >= cut]
-        print(f"\n  time split {time.strftime('%m-%d %H:%M', time.gmtime(cut))} "
-              f"(train {len(tr)} / holdout {len(ho)})")
+        tr, ho = TR, HO
         print(f"\n  {'filter':<28} | {'TRAIN n':>8} {'mean':>8} {'ex1':>8} | {'HOLDOUT n':>10} {'mean':>8} {'ex1':>8} {'win%':>6}")
         rows = []
         for nm, pred in FILTERS:

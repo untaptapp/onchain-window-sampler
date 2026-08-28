@@ -1,0 +1,36 @@
+name: trending-gmgn
+
+# GMGN trending poller — richest board-level momentum + quality feed (GET /v1/market/rank).
+# Pre-computes is_wash_trading, bundler_rate, sniper/smart-money/KOL counts, concentration,
+# multi-window momentum, age. GMGN is a top scanner, so its rank is itself an attention event.
+# Data auth is X-APIKEY only (no signing). Same self-poll pattern; budget-aware + fail-loud.
+# Writes trending_snapshots with source='gmgn'. Needs the GMGN_KEY secret (read-only key).
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: trending-gmgn
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GMGN_KEY: ${{ secrets.GMGN_KEY }}
+          RUN_SECONDS: '20000'
+          PASS_INTERVAL: '900'    # every 15 min; dial to taste within the free-tier rate limit
+          GMGN_INTERVAL: '5m'
+          GMGN_CHAIN: 'sol'
+          GMGN_LIMIT: '100'
+        run: python trending_gmgn.py

@@ -38,3 +38,14 @@ create index if not exists pump_launches_migrated_idx on pump_launches(migrated_
   where migrated_at is not null;
 
 alter table pump_launches enable row level security;
+
+-- DERIVED VIEW `pump_launches_usd` (created via the Management API, not this file):
+--   sol_usd_at_birth, mcap_usd = market_cap_sol * sol_price, liq_usd = v_sol_curve * sol_price * 2
+-- joined to the NEAREST sol_usd_ref bar. A view rather than stored columns, because a USD figure
+-- written at insert time goes stale the moment SOL moves and needs re-backfilling whenever the SOL
+-- reference improves.
+--
+-- IMPORTANT — birth size does NOT work as a matching covariate. Every pump.fun token starts on the
+-- same bonding curve, so mcap_usd at birth is p25 $2,898 / median $2,946 / p90 $3,926: essentially
+-- a constant. Risk-set matching needs size AT THE MATCHING TIME (T_case - L), which comes from the
+-- minute bars (mcap = price * supply; pump.fun supply is ~1e9), not from these birth fields.

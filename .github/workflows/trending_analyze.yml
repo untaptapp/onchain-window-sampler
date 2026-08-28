@@ -1,0 +1,29 @@
+name: trending-analyze
+
+# Scheduled rollup: turns raw trending_snapshots into trending_outcomes (entry features +
+# static-horizon returns + MFE/MAE) and trending_strategy_stats (auto-updating winning-subset
+# hunt). Makes the analysis continuous — no manual script runs. Short batch job; reads snapshots,
+# never writes them. Independent of the collectors/tracker.
+on:
+  schedule:
+    - cron: '25 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: trending-analyze
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python trending_analyze.py

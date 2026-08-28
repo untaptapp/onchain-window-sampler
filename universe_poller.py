@@ -26,7 +26,7 @@ filters belong in analysis, where they can be varied and pre-registered; discard
 collection time would silently fix a choice we have not yet justified.
 
 Env: SUPABASE_URL, SUPABASE_KEY.
-     PAGES (default 8 per sort), SLEEP (default 2.2 -> ~27 req/min), PASS_INTERVAL (default 300),
+     PAGES (default 10 per sort; GeckoTerminal caps at page 10), SLEEP (default 2.2 -> ~27 req/min), PASS_INTERVAL (default 300),
      RUN_SECONDS (default 20000 ~5.5h).
 """
 import json, os, time, urllib.request, urllib.error
@@ -35,14 +35,18 @@ SB = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1"
 KEY = os.environ["SUPABASE_KEY"]
 GT = "https://api.geckoterminal.com/api/v2/networks/solana"
 UA = {"Accept": "application/json;version=20230302", "User-Agent": "Mozilla/5.0"}
-PAGES = int(os.environ.get("PAGES", "8"))
+PAGES = min(int(os.environ.get("PAGES", "10")), 10)
 SLEEP = float(os.environ.get("SLEEP", "2.2"))
 PASS_INTERVAL = int(os.environ.get("PASS_INTERVAL", "300"))
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "20000"))
 
+# GeckoTerminal only accepts a small set of sort options — `h1_volume_usd_desc` and
+# `pool_created_at_desc` return HTTP 400, so that sweep was silently contributing nothing.
+# Valid: h24_volume_usd_desc, h24_tx_count_desc. Pages cap at 10 (page 11 -> 401).
 SWEEPS = [("h24_vol", "/pools?sort=h24_volume_usd_desc&page={p}"),
-          ("h1_vol",  "/pools?sort=h1_volume_usd_desc&page={p}"),
+          ("h24_tx",  "/pools?sort=h24_tx_count_desc&page={p}"),
           ("new",     "/new_pools?page={p}")]
+MAX_PAGE = 10
 
 
 def sb(method, path, body=None, prefer=None):

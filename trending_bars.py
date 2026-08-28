@@ -32,7 +32,12 @@ rather than trusting any board's clock, and (b) backtest entering BEFORE the boa
 which is the actual thesis. Because GeckoTerminal OHLCV is backfillable, this needs no streaming
 infrastructure: the pre-trend counterfactual is answerable from history we can still fetch.
 
-Free + keyless. Reads trending_snapshots, writes only trending_pools / trending_bars.
+Covers BOTH arms of the prediction study: mints that reached a trending board (cases) and a random
+sample of eligible mints from `candidate_universe` that did not (controls). Collecting bars only for
+cases would break the study twice over — the model could learn "has bars" = case, and we could never
+test whether a flagged token that never trends is profitable anyway.
+
+Free + keyless. Reads trending_snapshots / candidate_universe, writes only trending_pools / trending_bars.
 
 Env: SUPABASE_URL, SUPABASE_KEY. MAX_CALLS (default 900), SLEEP (default 2.1 -> ~28 req/min),
      PRE_MIN (default 30), POST_H (default 12), RUN_SECONDS (default 0 = single pass),
@@ -49,6 +54,12 @@ PRE_MIN = int(os.environ.get("PRE_MIN", "360"))
 POST_H = float(os.environ.get("POST_H", "12"))
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))
 MIN_OBS = int(os.environ.get("MIN_OBS", "3"))
+# Share of the call budget spent on CONTROL mints drawn from candidate_universe. Without this,
+# minute bars exist only for tokens that reached a board, and the prediction study breaks two ways:
+# (1) cases would have richer features than controls, so a model could trivially learn "has bars"
+#     = case; and (2) we could never test the second success criterion — whether a flagged token
+# that NEVER trends is still profitable — because we would have no price path for it.
+UNIVERSE_FRAC = float(os.environ.get("UNIVERSE_FRAC", "0.4"))
 GT = "https://api.geckoterminal.com/api/v2/networks/solana"
 UA = {"Accept": "application/json;version=20230302", "User-Agent": "Mozilla/5.0"}
 
@@ -173,15 +184,39 @@ def main():
         # a mint seen once has no path to model — never spend GT calls on it
         first = {m: t for m, t in first.items() if nobs[m] >= MIN_OBS}
         pools = {p["mint"]: p for p in sb_all("/trending_pools?select=mint,pool_address,ok")}
+        # Coverage from a server-side aggregate view. Deriving per-mint min/max/count by scanning
+        # every bar row client-side is O(all bars) on EVERY pass — it already timed out at 122k
+        # rows and would only get worse as the table grows.
         have = defaultdict(lambda: [None, None, 0])
-        for r in sb_all("/trending_bars?select=mint,ts"):
-            h = have[r["mint"]]
-            h[0] = r["ts"] if h[0] is None else min(h[0], r["ts"])
-            h[1] = r["ts"] if h[1] is None else max(h[1], r["ts"])
-            h[2] += 1
+        for r in sb_all("/trending_bar_coverage?select=mint,ts_from,ts_to,n_bars"):
+            have[r["mint"]] = [r["ts_from"], r["ts_to"], r["n_bars"]]
         now = time.time()
+        # CONTROL arm: sample mints seen in the candidate universe that never reached a board.
+        # Sampled at random (not by rank) so the control pool stays an unbiased draw from the
+        # population at risk — selecting "most active controls" would bias the comparison.
+        controls = {}
+        if UNIVERSE_FRAC > 0:
+            uni = sb_all("/candidate_universe?select=mint,captured_at,liquidity"
+                         "&order=captured_at.desc&limit=1000")
+            seen_board = set(first)
+            for r in uni:
+                m = r.get("mint")
+                if not m or m in seen_board or m in controls:
+                    continue
+                if (r.get("liquidity") or 0) < 10000:      # the pre-registered eligibility floor
+                    continue
+                controls[m] = r["captured_at"]
+            import random as _r
+            _r.seed(int(now) // 3600)                       # stable within the hour, varies across
+            keys = list(controls)
+            _r.shuffle(keys)
+            controls = {k: controls[k] for k in keys}
         # least-covered first, so a budgeted run always makes progress and is resumable
         todo = sorted(first.items(), key=lambda kv: have[kv[0]][2])
+        n_ctrl = int(len(todo) * UNIVERSE_FRAC / max(1e-9, 1 - UNIVERSE_FRAC)) if UNIVERSE_FRAC < 1 else len(controls)
+        ctrl_todo = [(m, t) for m, t in list(controls.items())[:max(0, n_ctrl)]]
+        todo = todo + ctrl_todo
+        print(f"  control arm: {len(controls)} eligible universe mints, {len(ctrl_todo)} queued", flush=True)
         print(f"universe {len(first)} mints · {len(pools)} pools cached · "
               f"{sum(1 for m in first if have[m][2])} with bars · budget {MAX_CALLS}", flush=True)
         new_pools, new_bars, done = [], [], 0

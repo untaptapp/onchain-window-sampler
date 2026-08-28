@@ -34,6 +34,7 @@ SPLIT = float(os.environ.get("SPLIT", "0.5"))
 # tradeable entries and must be dropped, not repriced. The drop rate is reported, since excluding
 # untradeable names is itself a survivorship choice.
 ENTRY_TOL_MIN = float(os.environ.get("ENTRY_TOL_MIN", "5"))
+_S = defaultdict(int)          # fallback counters — every silent path must be countable
 
 
 def sb_all(path, page=1000, cap=800000):
@@ -60,9 +61,12 @@ BANDS = ((0, 15000), (15000, 50000), (50000, 200000), (200000, 1e6), (1e6, 9e12)
 FIT = {0: (0.112, 0.77), 1: (0.937, 0.29), 2: (0.901, 0.17), 3: (0.168, 0.22), 4: (0.039, 0.87)}
 
 
-def cost(tvl, usd=None):
+def cost(tvl, usd=None, stats=None):
     usd = SIZE_USD if usd is None else usd
     if not tvl or tvl <= 0:
+        # A missing TVL silently applied a 50% round-trip. It fires on 0% of the current sample —
+        # precisely when to make a landmine visible, rather than after it starts firing.
+        if stats is not None: stats["cost_fallback"] += 1
         return 0.50
     i = next((k for k, (lo, hi) in enumerate(BANDS) if lo <= tvl < hi), 4)
     a, b = FIT[i]
@@ -250,14 +254,32 @@ def load_entries(solat):
     return ents
 
 
-def liq_at(ls, ts):
-    """Liquidity prevailing at a moment — the exit leg must not be priced at entry liquidity."""
-    best = None
+LIQ_TOL_MIN = float(os.environ.get("LIQ_TOL_MIN", "45"))
+
+
+def liq_at(ls, ts, stats=None):
+    """Liquidity prevailing at `ts`, from the most recent observation AT OR BEFORE it.
+
+    Replaces two defects. (a) Picking the *nearest* reading could select one from AFTER the exit —
+    look-ahead, pricing a fill with liquidity we could not have known. (b) Nearest-without-tolerance
+    costed 31% of exits with a reading >30 min away (14% >2h, worst 12h), defeating the point of
+    point-in-time costing: liquidity drains exactly when price falls, so a stale reading
+    systematically under-prices the exit leg of a loser.
+
+    Falls back to the last known value when nothing is recent enough, and COUNTS it — an invisible
+    fallback is how the first version of this survived."""
+    prev = None
     for t, v in ls:
-        if v is None: continue
-        if best is None or abs(t - ts) < abs(best[0] - ts):
-            best = (t, v)
-    return best[1] if best else None
+        if v is None or t > ts:
+            continue
+        if prev is None or t > prev[0]:
+            prev = (t, v)
+    if prev is None:
+        if stats is not None: stats["liq_none"] += 1
+        return None
+    if (ts - prev[0]) / 60 > LIQ_TOL_MIN:
+        if stats is not None: stats["liq_stale"] += 1
+    return prev[1]
 
 
 def gross_return(e, rule, solat):
@@ -273,9 +295,11 @@ def net_return(e, rule, solat):
     if g is None:
         return None
     a, b = solat(e["t0"]), solat(xts)
+    if not (a and b):
+        _S["sol_missing"] += 1     # returning a USD number here mixes denominations in one average
     r = ((1 + g) * (a / b) - 1) if (a and b) else g      # SOL-denominated
-    c_in = cost(e["liq"])
-    c_out = cost(liq_at(e["liqser"], xts) or e["liq"])
+    c_in = cost(e["liq"], stats=_S)
+    c_out = cost(liq_at(e["liqser"], xts, stats=_S) or e["liq"], stats=_S)
     return r - c_in - c_out
 
 
@@ -372,3 +396,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    print(f"\nfallbacks fired: {dict(_S) or 'none'}  "
+          f"(liq_stale = exit costed with liquidity older than {LIQ_TOL_MIN:.0f} min)")

@@ -29,5 +29,6 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           RUN_SECONDS: '20000'
           PASS_INTERVAL: '600'
-          MAX_QUOTES: '400'
+          MAX_QUOTES: '900'
+          SLEEP: '0.3'
         run: python trending_quotes.py

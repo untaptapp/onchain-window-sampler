@@ -34,7 +34,13 @@ Source: Jupiter lite-api /swap/v1/quote — free, keyless, the actual executable
 
 Env: SUPABASE_URL, SUPABASE_KEY.
      RUN_SECONDS (default 20000 ~5.5h), PASS_INTERVAL (default 600 =10 min),
-     MAX_QUOTES (Jupiter calls per pass, default 400), SIZES_SOL (default '0.25,1,5').
+     MAX_QUOTES (Jupiter calls per pass, default 1200), SLEEP (default 0.3),
+     SIZES_SOL  — full ladder for tokens younger than LADDER_FULL_H (default
+                  '0.25,1,2.5,5,10,25,50' ~= $26..$5,300 at SOL $106),
+     SIZES_SOL_SPARSE — reduced ladder for older tokens (default '1,5,25'), so the call
+                  budget concentrates where entries and exits actually happen,
+     SKIP_TVL_MULT (default 1.5) — don't spend a call quoting a clip larger than 1.5x the
+                  whole pool; the answer is known ("untradeable") and carries no curve info.
 """
 import json, os, time, urllib.request, urllib.error
 from collections import defaultdict
@@ -45,8 +51,13 @@ JUP = os.environ.get("JUP_BASE", "https://lite-api.jup.ag").rstrip("/")
 SOL = "So11111111111111111111111111111111111111112"
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "20000"))
 PASS_INTERVAL = int(os.environ.get("PASS_INTERVAL", "600"))
-MAX_QUOTES = int(os.environ.get("MAX_QUOTES", "400"))
-SIZES = [float(x) for x in os.environ.get("SIZES_SOL", "0.25,1,5").split(",")]
+MAX_QUOTES = int(os.environ.get("MAX_QUOTES", "1200"))
+SLEEP = float(os.environ.get("SLEEP", "0.3"))
+SIZES = [float(x) for x in os.environ.get("SIZES_SOL", "0.25,1,2.5,5,10,25,50").split(",")]
+SIZES_SPARSE = [float(x) for x in os.environ.get("SIZES_SOL_SPARSE", "1,5,25").split(",")]
+LADDER_FULL_H = float(os.environ.get("LADDER_FULL_H", "12"))
+SKIP_TVL_MULT = float(os.environ.get("SKIP_TVL_MULT", "1.5"))
+USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 UA = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
 
@@ -68,6 +79,19 @@ def sb(method, path, body=None, prefer=None):
         except Exception:
             time.sleep(1.5 * (a + 1))
     return 0, None
+
+
+def sol_usd():
+    """SOL price from a 1-SOL -> USDC quote; used to skip clips larger than the pool itself."""
+    try:
+        u = f"{JUP}/swap/v1/quote?inputMint={SOL}&outputMint={USDC}&amount=1000000000&slippageBps=100"
+        with urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=15) as r:
+            q = json.loads(r.read())
+        if q.get("swapUsdValue"):
+            return float(q["swapUsdValue"])
+        return int(q["outAmount"]) / 1e6
+    except Exception:
+        return 150.0
 
 
 def cadence(age_h):
@@ -151,15 +175,26 @@ def one_pass():
             # youngest first — those are the ones at/near entry
             due.append((age_h, m))
     due.sort()
-    budget = max(1, MAX_QUOTES // max(1, len(SIZES)))
-    due = due[:budget]
-    rows, unroutable = [], 0
+    spend = 0
+    deadline = time.time() + PASS_INTERVAL * 0.8      # never overrun the pass interval
+    px = sol_usd()
+    rows, unroutable, skipped, n_mints = [], 0, 0, 0
     for age_h, m in due:
+        if spend >= MAX_QUOTES or time.time() >= deadline:
+            break
         ts = int(time.time())
         meta = latest.get(m) or {}
-        for sz in SIZES:
-            q = quote(m, sz)
-            time.sleep(0.35)
+        tvl = meta.get("liquidity")
+        # full ladder while the token is young (that is where entries and most exits sit),
+        # sparse ladder afterwards, so the budget buys resolution where we actually model
+        ladder = SIZES if age_h < LADDER_FULL_H else SIZES_SPARSE
+        n_mints += 1
+        for sz in ladder:
+            if tvl and (sz * px) > SKIP_TVL_MULT * tvl:
+                skipped += 1
+                continue
+            q = quote(m, sz); spend += 1
+            time.sleep(SLEEP)
             ok = bool(q.get("ok"))
             if not ok:
                 unroutable += 1
@@ -181,7 +216,8 @@ def one_pass():
         else:
             print(f"write failed status={st}", flush=True)
             return "fail", wrote
-    print(f"pass: {len(due)} mints due, {wrote} quote rows written, {unroutable} unroutable", flush=True)
+    print(f"pass: {n_mints}/{len(due)} mints quoted, {wrote} rows written, "
+          f"{unroutable} unroutable, {skipped} skipped (clip>pool), {spend} jupiter calls", flush=True)
     return "ok", wrote
 
 

@@ -1,0 +1,33 @@
+name: trending-quotes
+
+# Point-in-time EXECUTION COST collector (Jupiter routed quotes) for every trending mint.
+# Execution cost is a moving, point-in-time quantity and Jupiter has NO historical quote API,
+# so any interval we don't sample is permanently un-costable — this must run continuously.
+# Self-poll pattern like the other collectors (cron = restart heartbeat; concurrency keeps one job).
+# Reads trending_snapshots, writes only trending_quotes.
+on:
+  schedule:
+    - cron: '*/50 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: trending-quotes
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          RUN_SECONDS: '20000'
+          PASS_INTERVAL: '600'
+          MAX_QUOTES: '400'
+        run: python trending_quotes.py

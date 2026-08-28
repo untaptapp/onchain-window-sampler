@@ -91,9 +91,39 @@ def filters_for(source):
     return f
 
 
-def build_outcomes(source):
+QUOTE_SIZE_SOL = float(os.environ.get("QUOTE_SIZE_SOL", "1"))
+QUOTE_TOL_SEC = int(os.environ.get("QUOTE_TOL_SEC", "5400"))   # 90 min
+
+
+def load_quotes():
+    """mint -> sorted [(ts, price_impact_pct)] at the reference size, for point-in-time costing."""
+    rows = sb("GET", "/trending_quotes?select=mint,quoted_at,size_sol,price_impact_pct,ok"
+                     f"&size_sol=eq.{QUOTE_SIZE_SOL}&ok=is.true"
+                     "&order=quoted_at.asc&limit=200000")[1]
+    q = defaultdict(list)
+    if isinstance(rows, list):
+        for r in rows:
+            if r.get("price_impact_pct") is not None:
+                q[r["mint"]].append((r["quoted_at"], r["price_impact_pct"]))
+    return q
+
+
+def nearest_quote(quotes, mint, ts):
+    """Quoted impact closest in time to `ts`, or None if we never sampled near that moment.
+    Deliberately returns None rather than reaching for a far-away quote: a cost from three hours
+    later is not the cost you would have paid."""
+    if not quotes:
+        return None
+    arr = quotes.get(mint)
+    if not arr:
+        return None
+    best = min(arr, key=lambda z: abs(z[0] - ts))
+    return best[1] if abs(best[0] - ts) <= QUOTE_TOL_SEC else None
+
+
+def build_outcomes(source, quotes=None):
     rows = sb("GET", f"/trending_snapshots?source=eq.{source}"
-                     "&select=mint,captured_at,rank,price,market_cap,extra"
+                     "&select=mint,captured_at,rank,price,market_cap,liquidity,extra"
                      "&order=captured_at.asc&limit=300000")[1]
     if not isinstance(rows, list):
         return []
@@ -120,6 +150,27 @@ def build_outcomes(source):
         peak = max(series, key=lambda z: z[1])
         rec["mfe_pct"] = peak[1]; rec["mfe_min"] = int(peak[0])
         rec["mae_pct"] = min(v for _, v in series)
+        # POINT-IN-TIME liquidity. Execution cost is not a property of the token, it is a property
+        # of the MOMENT — liquidity drains ~11% exactly when price falls, so the sell leg of a
+        # losing trade is dearer than the buy leg. Carrying only "latest" liquidity would misprice
+        # every modelled entry and exit, so record it at each point we actually model.
+        peak_pt = max(pts, key=lambda x: x["price"])
+        liqs = [x.get("liquidity") for x in pts if x.get("liquidity")]
+        rec["entry_liq"] = pts[0].get("liquidity")
+        rec["mfe_liq"] = peak_pt.get("liquidity")
+        rec["last_liq"] = pts[-1].get("liquidity")
+        rec["min_liq"] = min(liqs) if liqs else None
+        # quoted execution cost (Jupiter) nearest the entry and nearest the exit, when we have it.
+        # Quotes only exist from the moment trending_quotes.py started — history is un-costable.
+        qe = nearest_quote(quotes, m, t0)
+        qx = nearest_quote(quotes, m, pts[-1]["captured_at"] / 1000)
+        rec["q_entry_imp"] = qe; rec["q_exit_imp"] = qx
+        # keys must be present on EVERY row — PostgREST rejects a ragged batch
+        rec["net_mfe"] = rec["net_last"] = None
+        if qe is not None and qx is not None:
+            rt = (qe + qx) / 100.0
+            rec["net_mfe"] = rec["mfe_pct"] - rt
+            rec["net_last"] = rec["last_ret"] - rt
         rec["updated_at"] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         outs.append(rec)
     return outs
@@ -127,7 +178,8 @@ def build_outcomes(source):
 
 def rollup_stats(source, outs, run_ts):
     stats = []
-    hz_map = {"mfe": "mfe_pct", "1h": "ret_1h", "2h": "ret_2h", "last": "last_ret"}
+    hz_map = {"mfe": "mfe_pct", "1h": "ret_1h", "2h": "ret_2h", "last": "last_ret",
+              "net_mfe": "net_mfe", "net_last": "net_last"}
     for fname, pred in filters_for(source):
         sub = [o for o in outs if pred(o)]
         for hname, col in hz_map.items():
@@ -143,9 +195,11 @@ def rollup_stats(source, outs, run_ts):
 
 def main():
     run_ts = int(time.time())
+    quotes = load_quotes()
+    print(f"loaded quotes for {len(quotes)} mints @ {QUOTE_SIZE_SOL} SOL", flush=True)
     all_stats = []
     for source in ("geckoterminal", "solanatracker", "gmgn", "fomoscan"):
-        outs = build_outcomes(source)
+        outs = build_outcomes(source, quotes)
         if not outs:
             continue
         # upsert outcomes in chunks

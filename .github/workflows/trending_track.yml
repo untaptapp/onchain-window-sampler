@@ -1,0 +1,30 @@
+name: trending-track
+
+# Long-horizon price/mcap tracker for every mint seen in trending_snapshots. Follows tokens
+# indefinitely (incl. after they leave the board) into trending_tracks — for long-term
+# winner/moonshot discovery and the post-entry paths used to model exit timing. Horizon is
+# hours/days, so schedule jitter is irrelevant; short job. Independent of the snapshot feeds.
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: trending-track
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          MAX_CALLS: '150'
+        run: python trending_tracker.py

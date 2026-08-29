@@ -70,6 +70,8 @@ POST_H = float(os.environ.get("POST_H", "6"))
 # unknown, which coalesce() turns into a 1970 creation date; see trending_mint_age.
 LONG_POST_H = float(os.environ.get("LONG_POST_H", "24"))
 LONG_AGE_S = 86400
+# Which snapshot sources are Solana. See the allowlist note in main().
+SOL_SOURCES = os.environ.get("SOL_SOURCES", "gmgn,solanatracker,geckoterminal,fomoscan")
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))
 MIN_OBS = int(os.environ.get("MIN_OBS", "3"))
 # Share of the call budget spent on CONTROL mints drawn from candidate_universe. Without this,
@@ -196,7 +198,14 @@ def fetch_bars(pool, need_from, need_to):
 def main():
     t_end = time.time() + RUN_SECONDS if RUN_SECONDS else None
     while True:
-        snaps = sb_all("/trending_snapshots?select=mint,captured_at&order=captured_at.asc")
+        # SOLANA sources only, as an ALLOWLIST. trending_snapshots is now multi-chain
+        # (source='gmgn_rh' carries Robinhood Chain, chain id 4663, EVM addresses), and this
+        # collector resolves pools against GeckoTerminal's `solana` network. Without the filter it
+        # would spend the GT call budget resolving 0x… addresses that can never resolve, and cache
+        # each failure as ok=false in trending_pools. An allowlist rather than a denylist so the
+        # next chain we add fails closed — invisible to this collector until deliberately included.
+        snaps = sb_all(f"/trending_snapshots?source=in.({SOL_SOURCES})"
+                       "&select=mint,captured_at&order=captured_at.asc")
         first, nobs = {}, defaultdict(int)
         for r in snaps:
             m, t = r["mint"], r["captured_at"] / 1000

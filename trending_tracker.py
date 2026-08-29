@@ -17,6 +17,7 @@ import json, os, time, urllib.request, urllib.error
 from collections import defaultdict
 
 SB = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1"
+SOL_SOURCES = os.environ.get("SOL_SOURCES", "gmgn,solanatracker,geckoterminal,fomoscan")
 KEY = os.environ["SUPABASE_KEY"]
 MAX_CALLS = int(os.environ.get("MAX_CALLS", "120"))
 UA = {"Accept": "application/json;version=20230302", "User-Agent": "Mozilla/5.0"}
@@ -106,8 +107,11 @@ def price_mcap(mint):
 
 def first_sightings():
     """Earliest trending sighting per mint (mint -> {ts, source, price, mcap, symbol})."""
-    rows = sb_all("/trending_snapshots?select=mint,captured_at,price,market_cap,handle,source"
-                     "&order=captured_at.asc")
+    # Solana sources only — trending_snapshots is multi-chain since source='gmgn_rh'
+    # (Robinhood Chain, EVM addresses), and everything downstream of here assumes Solana.
+    rows = sb_all(f"/trending_snapshots?source=in.({SOL_SOURCES})"
+                  "&select=mint,captured_at,price,market_cap,handle,source"
+                  "&order=captured_at.asc")
     first = {}
     if isinstance(rows, list):
         for r in rows:

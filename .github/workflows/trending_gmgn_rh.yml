@@ -1,0 +1,55 @@
+name: trending-gmgn-rh
+
+# GMGN trending poller for ROBINHOOD CHAIN (chain id 4663, native ETH), writing
+# trending_snapshots with source='gmgn_rh'.
+#
+# Why a second chain: on the cohort this project actually trades — the top-100 trending board —
+# Robinhood carries MORE volume than Solana ($351.9M vs $237.5M measured 2026-08-29) and, far more
+# importantly, ~7x the median liquidity ($174k vs $24k). Liquidity is this investigation's binding
+# constraint: `liq>=50k` is NEGATIVE in both Solana tracks, i.e. returns concentrate exactly where
+# size cannot be deployed. A venue with 7x the depth is a direct attack on that constraint.
+# (Chain-wide Robinhood is still far smaller than Solana — TVL 27:1 — so this is a claim about the
+# trending cohort, not about the chain.)
+#
+# Why board data FIRST, before bars/quotes/launches: GeckoTerminal serves full OHLCV history and
+# RPC logs are permanent, so those three can all be backfilled. Board RANK history cannot — an
+# interval we do not sample is gone forever, the same reason trending_quotes.py samples
+# continuously. Every hour of delay is an hour of Robinhood board history we can never recover.
+#
+# Isolation: source='gmgn_rh' is distinct, trending_snapshots is unique on
+# (mint, captured_at, source), and backtest.load_entries iterates an EXPLICIT source list. So these
+# rows cannot reach a frozen Solana track, and no schema migration is required.
+#
+# Quota: the Solana poller measured 98 polls/24h with max gap 901s and zero gaps >30 min, i.e. no
+# rate limiting at the 15-min cadence. This doubles GMGN calls to ~196/day, which that headroom
+# covers comfortably.
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'   # offset from the Solana poller so the two never burst together
+  workflow_dispatch: {}
+
+concurrency:
+  group: trending-gmgn-rh
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GMGN_KEY: ${{ secrets.GMGN_KEY }}
+          RUN_SECONDS: '20000'
+          PASS_INTERVAL: '900'
+          GMGN_INTERVAL: '5m'
+          GMGN_CHAIN: 'robinhood'
+          SOURCE: 'gmgn_rh'
+          GMGN_LIMIT: '100'
+        run: python trending_gmgn.py

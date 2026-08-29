@@ -25,6 +25,11 @@ GKEY = os.environ["GMGN_KEY"]
 BASE = os.environ.get("GMGN_BASE", "https://openapi.gmgn.ai").rstrip("/")
 INTERVAL = os.environ.get("GMGN_INTERVAL", "5m")
 CHAIN = os.environ.get("GMGN_CHAIN", "sol")
+# The `source` value is what keeps chains apart. trending_snapshots is unique on
+# (mint, captured_at, source) and backtest.load_entries iterates an EXPLICIT source list, so a new
+# chain written under its own source is invisible to the frozen Solana analysis by construction —
+# no schema migration, and no way for Robinhood rows to leak into a pre-registered Solana track.
+SOURCE = os.environ.get("SOURCE", "gmgn")
 GLIMIT = int(os.environ.get("GMGN_LIMIT", "100"))
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "20000"))
 PASS_INTERVAL = int(os.environ.get("PASS_INTERVAL", "900"))
@@ -36,7 +41,13 @@ EXTRA_KEYS = ["price_change_percent1m", "price_change_percent5m", "price_change_
               "hot_level", "is_wash_trading", "rug_ratio", "sniper_count", "smart_degen_count",
               "renowned_count", "bundler_rate", "entrapment_ratio", "rat_trader_amount_rate",
               "bluechip_owner_percentage", "renounced_mint", "renounced_freeze_account",
-              "burn_ratio", "cto_flag", "is_og", "history_highest_market_cap"]
+              "burn_ratio", "cto_flag", "is_og", "history_highest_market_cap",
+              # EVM-only (Robinhood Chain and other EVM boards). Absent from Solana responses, and
+              # the comprehension below is keyed on `k in it`, so Solana rows are unaffected.
+              # These are the EVM analogue of rug risk and have no Solana equivalent: measured on
+              # the robinhood board, all 100/100 rows populate them.
+              "is_honeypot", "buy_tax", "sell_tax", "is_open_source", "is_renounced",
+              "lock_percent", "launchpad", "gas_fee", "top70_sniper_hold_rate"]
 
 
 def sb(method, path, body=None, prefer=None):
@@ -107,7 +118,7 @@ def one_pass():
             continue
         seen.add(mint); pos += 1
         rows.append({
-            "mint": mint, "captured_at": cap, "polled_at": polled, "source": "gmgn",
+            "mint": mint, "captured_at": cap, "polled_at": polled, "source": SOURCE,
             "rank": pos, "handle": it.get("symbol"), "label": it.get("name"),
             "volume": _f(it.get("volume")), "market_cap": _f(it.get("market_cap")),
             "price": _f(it.get("price")), "liquidity": _f(it.get("liquidity")),
@@ -118,7 +129,8 @@ def one_pass():
     st, _ = sb("POST", "/trending_snapshots?on_conflict=mint,captured_at,source",
                rows, prefer="resolution=merge-duplicates,return=minimal")
     ok = st in (200, 201, 204)
-    print(f"pass cap={cap} rows={len(rows)} write={st}{'' if ok else ' FAIL'}", flush=True)
+    print(f"pass chain={CHAIN} source={SOURCE} cap={cap} rows={len(rows)} "
+          f"write={st}{'' if ok else ' FAIL'}", flush=True)
     return ("wrote" if ok else "fail"), len(rows)
 
 

@@ -269,8 +269,18 @@ def main():
             keys = list(controls)
             _r.shuffle(keys)
             controls = {k: controls[k] for k in keys}
-        # least-covered first, so a budgeted run always makes progress and is resumable
-        todo = sorted(first.items(), key=lambda kv: have[kv[0]][2])
+        # Least-covered first, so a budgeted run always makes progress and is resumable — but among
+        # the mints with NO bars at all, newest sighting first.
+        #
+        # Sorting on n_bars alone made every zero-bar mint tie, and Python's stable sort then kept
+        # them in `first`'s insertion order, which is OLDEST first. With a standing backlog of ~1,600
+        # uncovered mints, brand-new sightings sorted to the BACK of that queue every pass, and pool
+        # resolution ran a measured 583.9 minutes (9.7h) behind first sighting: 0% of mints seen in
+        # the last 6h had any bars, against ~90% by 9h. The pipeline was keeping pace but never
+        # catching up, so the freshest data — the data a forward test is made of — was always the
+        # last to arrive. GeckoTerminal serves full history, so the backlog loses nothing by waiting;
+        # a fresh sighting waiting is a fresh sighting we cannot act on.
+        todo = sorted(first.items(), key=lambda kv: (have[kv[0]][2], -kv[1]))
         ctrl_todo = list(controls.items())
         # INTERLEAVE, don't append. Concatenating controls after every case made them structurally
         # unreachable: with hundreds of cases queued ahead of them, no finite call budget ever

@@ -59,6 +59,13 @@ PRE_MIN = int(os.environ.get("PRE_MIN", "360"))
 # 52 min), so the extra 9h was pure cost. PRE_MIN stays at 6h — that is the pre-trend window the
 # front-run counterfactual actually needs.
 POST_H = float(os.environ.get("POST_H", "3"))
+# Tokens at least a day old at first sighting (the "Track A" revival track) get a LONGER post
+# window, because their exit rule cannot resolve inside 3h: 60.5% of Track A trades were still open
+# at a 3h horizon and were being marked to market and scored as if closed. The short window stays
+# for fresh launches, whose stop fires inside 3h for 93.6% of trades — the extra bars there are pure
+# cost. Track A is 21% of mints (771 of 3,659), so this is ~+21% bars, not ~+4x.
+LONG_POST_H = float(os.environ.get("LONG_POST_H", "12"))
+LONG_AGE_S = 86400
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))
 MIN_OBS = int(os.environ.get("MIN_OBS", "3"))
 # Share of the call budget spent on CONTROL mints drawn from candidate_universe. Without this,
@@ -194,6 +201,13 @@ def main():
                 first[m] = t
         # a mint seen once has no path to model — never spend GT calls on it
         first = {m: t for m, t in first.items() if nobs[m] >= MIN_OBS}
+        # Which mints get the long post window. Read from the trending_mint_age VIEW, which is the
+        # single definition shared with prune_trending_bars — if the collector and the retention job
+        # disagreed, one would fetch bars the other immediately deletes, burning GT calls forever.
+        long_post = {r["mint"] for r in sb_all("/trending_mint_age?select=mint,age_s"
+                                               f"&age_s=gte.{LONG_AGE_S}")}
+        print(f"long post window ({LONG_POST_H}h): {len(long_post)} mints; "
+              f"{POST_H}h for the rest", flush=True)
         pools = {p["mint"]: p for p in sb_all("/trending_pools?select=mint,pool_address,ok")}
         # Coverage from a server-side aggregate view. Deriving per-mint min/max/count by scanning
         # every bar row client-side is O(all bars) on EVERY pass — it already timed out at 122k
@@ -288,7 +302,7 @@ def main():
             if not p.get("ok") or not p.get("pool_address"):
                 continue
             need_from = t0 - PRE_MIN * 60
-            need_to = min(now, t0 + POST_H * 3600)
+            need_to = min(now, t0 + (LONG_POST_H if mint in long_post else POST_H) * 3600)
             cov = have[mint]
             # already covered (allow a 3-bar edge tolerance)
             if cov[0] is not None and cov[0] <= need_from + 180 and cov[1] >= need_to - 180:
@@ -321,8 +335,17 @@ def main():
         # Runs as an RPC so the delete happens IN the database — pulling bars client-side to filter
         # them would burn the 5 GB monthly egress budget (one full read is already ~88 MB).
         st, pruned = sb("POST", "/rpc/prune_trending_bars", {})
+        # The other two retention jobs run here too, on the same cadence, because this is the only
+        # collector that already owns a server-side cleanup step. Measured at the time they were
+        # added: `extra` was 35 MB of trending_snapshots' 41 MB and only the FIRST row per
+        # (source, mint) is ever read, so nulling the rest took the table 55 MB -> 19 MB and its
+        # growth 27 -> ~6 MB/day. Both are idempotent and cheap when there is nothing to do.
+        st_x, nulled = sb("POST", "/rpc/prune_snapshot_extra", {})
+        st_u, uni = sb("POST", "/rpc/prune_candidate_universe", {})
         print(f"pass done: {done} mints filled, {len(new_pools)} pools resolved, "
-              f"{calls['n']} GT calls, pruned {pruned if st == 200 else f'FAILED({st})'} bars",
+              f"{calls['n']} GT calls, pruned {pruned if st == 200 else f'FAILED({st})'} bars, "
+              f"nulled {nulled if st_x == 200 else f'FAILED({st_x})'} extra, "
+              f"dropped {uni if st_u == 200 else f'FAILED({st_u})'} universe rows",
               flush=True)
         if not t_end or time.time() >= t_end:
             break

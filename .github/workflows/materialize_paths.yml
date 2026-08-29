@@ -1,0 +1,38 @@
+name: materialize-paths
+
+# Bar-resolution path outcomes -> trending_paths, so raw minute bars become droppable.
+# Bars grow ~59 MB/day and are unbounded in mint count; one path row is ~508 B and stands in for
+# ~45 kB of bars (~90x). Runs often enough that a mint's outcomes are captured well before any
+# retention window could reach its bars.
+#
+# KEEP_DAYS is the bar-retention switch and defaults to 0 (OFF) on purpose. Turning it on trades
+# the ability to backtest a NOT-YET-INVENTED exit rule for storage runway -- which is exactly the
+# trade that POST_H=3 made silently and wrongly. Set it deliberately.
+on:
+  schedule:
+    - cron: '25 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      keep_days:
+        description: 'Drop bars for mints materialised more than N days ago (0 = never)'
+        default: '0'
+
+concurrency:
+  group: materialize-paths
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          KEEP_DAYS: ${{ github.event.inputs.keep_days || '0' }}
+        run: python materialize_paths.py

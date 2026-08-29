@@ -58,13 +58,17 @@ PRE_MIN = int(os.environ.get("PRE_MIN", "360"))
 # which blows a 500 MB budget in under a day. The exit study never reads past ~2h (MFE peaks around
 # 52 min), so the extra 9h was pure cost. PRE_MIN stays at 6h — that is the pre-trend window the
 # front-run counterfactual actually needs.
-POST_H = float(os.environ.get("POST_H", "3"))
+# POST_H was 3 on a 500 MB free-tier storage argument, and that decision cost a retracted finding:
+# the CAPPED exit rule chosen later could not resolve inside 3h, so 60.5% of Track A trades were
+# still open at the horizon and were being marked to market and scored as closed. On the Pro plan
+# (8 GB) that constraint is gone, so the window is now set by what the RULES need, not by the disk.
+# 6h covers Track B comfortably (93.6% of its trades close within 3h).
+POST_H = float(os.environ.get("POST_H", "6"))
 # Tokens at least a day old at first sighting (the "Track A" revival track) get a LONGER post
-# window, because their exit rule cannot resolve inside 3h: 60.5% of Track A trades were still open
-# at a 3h horizon and were being marked to market and scored as if closed. The short window stays
-# for fresh launches, whose stop fires inside 3h for 93.6% of trades — the extra bars there are pure
-# cost. Track A is 21% of mints (771 of 3,659), so this is ~+21% bars, not ~+4x.
-LONG_POST_H = float(os.environ.get("LONG_POST_H", "12"))
+# window still, because that is the track whose rule needs the room. Track A is 21% of mints
+# (771 of 3,659) — the share is 21% and not 82% only because GMGN reports open_timestamp: 0 for
+# unknown, which coalesce() turns into a 1970 creation date; see trending_mint_age.
+LONG_POST_H = float(os.environ.get("LONG_POST_H", "24"))
 LONG_AGE_S = 86400
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))
 MIN_OBS = int(os.environ.get("MIN_OBS", "3"))
@@ -340,11 +344,14 @@ def main():
         # added: `extra` was 35 MB of trending_snapshots' 41 MB and only the FIRST row per
         # (source, mint) is ever read, so nulling the rest took the table 55 MB -> 19 MB and its
         # growth 27 -> ~6 MB/day. Both are idempotent and cheap when there is nothing to do.
-        st_x, nulled = sb("POST", "/rpc/prune_snapshot_extra", {})
+        # prune_snapshot_extra() is deliberately NOT called any more. It nulls `extra` on every
+        # snapshot but a mint's first, which on the free tier saved 21 MB/day — but `extra` is the
+        # point-in-time board record (rank, buy/sell counts, holder_count, bundler_rate as they
+        # MOVE), and destroying it forecloses any study of how a token's features evolve after it
+        # is first seen. The function stays deployed as a lever if storage ever binds again.
         st_u, uni = sb("POST", "/rpc/prune_candidate_universe", {})
         print(f"pass done: {done} mints filled, {len(new_pools)} pools resolved, "
               f"{calls['n']} GT calls, pruned {pruned if st == 200 else f'FAILED({st})'} bars, "
-              f"nulled {nulled if st_x == 200 else f'FAILED({st_x})'} extra, "
               f"dropped {uni if st_u == 200 else f'FAILED({st_u})'} universe rows",
               flush=True)
         if not t_end or time.time() >= t_end:

@@ -18,6 +18,10 @@
 -- event, which for a token that launches at T and trends at T+8h deletes exactly the post-trend
 -- bars the outcome and exit analysis need.
 --
+-- ⚠️  post_h / long_post_h here MUST match POST_H / LONG_POST_H in trending_bars.py. If the pruner
+-- is stricter than the collector, every pass re-fetches bars this job then deletes — a permanent
+-- GeckoTerminal call leak that shows up as "no progress" rather than as an error.
+--
 -- post_h is PER-MINT: tokens at least a day old at first sighting ("Track A", the revival track)
 -- get LONG_POST_H hours because their exit rule cannot resolve inside 3h — 60.5% of Track A trades
 -- were still open at the 3h horizon and were being scored as if closed. Fresh launches keep the
@@ -26,7 +30,7 @@
 -- Idempotent; safe to re-run.
 
 create or replace function public.prune_trending_bars(
-  pre_h integer default 6, post_h integer default 3, long_post_h integer default 12)
+  pre_h integer default 6, post_h integer default 6, long_post_h integer default 24)
 returns integer language plpgsql security definer as $$
 declare n integer; begin
   with a as (
@@ -89,7 +93,7 @@ end $$;
 -- candidate_universe is the risk-set control pool and a genuine time series (volume profiles for
 -- controls), so it cannot be deduplicated to first-sighting — but it grows ~23 MB/day unbounded.
 -- captured_at here is SECONDS, not milliseconds, unlike trending_snapshots.
-create or replace function public.prune_candidate_universe(keep_days integer default 7)
+create or replace function public.prune_candidate_universe(keep_days integer default 14)
 returns integer language plpgsql security definer as $$
 declare n integer; begin
   delete from candidate_universe

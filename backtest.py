@@ -61,6 +61,27 @@ BANDS = ((0, 15000), (15000, 50000), (50000, 200000), (200000, 1e6), (1e6, 9e12)
 FIT = {0: (0.112, 0.77), 1: (0.937, 0.29), 2: (0.901, 0.17), 3: (0.168, 0.22), 4: (0.039, 0.87)}
 
 
+# ---- venue FEES, which the impact model does not include -------------------------------------
+# The cost curve was fitted on Jupiter's priceImpactPct, which is price IMPACT — it excludes swap
+# fees entirely. pump.fun's bonding curve charges ~1% per side (~2% round trip); the post-graduation
+# AMMs charge ~0.25%. Ignoring this overstated bonding-curve returns by ~2pp, and bonding-curve
+# tokens are 26% of trending mints.
+FEE_BY_DEX = {"pump-fun": 0.010}          # per side
+FEE_DEFAULT = 0.0025                       # pumpswap / raydium / meteora / orca
+_DEX = {}
+
+
+def load_dex():
+    """mint -> dex, so the fee can follow the venue actually traded."""
+    global _DEX
+    _DEX = {r["mint"]: r.get("dex") for r in sb_all("/trending_pools?select=mint,dex")}
+    return _DEX
+
+
+def fee(mint):
+    return FEE_BY_DEX.get(_DEX.get(mint), FEE_DEFAULT)
+
+
 def cost(tvl, usd=None, stats=None):
     usd = SIZE_USD if usd is None else usd
     if not tvl or tvl <= 0:
@@ -298,8 +319,9 @@ def net_return(e, rule, solat):
     if not (a and b):
         _S["sol_missing"] += 1     # returning a USD number here mixes denominations in one average
     r = ((1 + g) * (a / b) - 1) if (a and b) else g      # SOL-denominated
-    c_in = cost(e["liq"], stats=_S)
-    c_out = cost(liq_at(e["liqser"], xts, stats=_S) or e["liq"], stats=_S)
+    f = fee(e["mint"])                      # per-side venue fee, excluded from the impact model
+    c_in = cost(e["liq"], stats=_S) + f
+    c_out = cost(liq_at(e["liqser"], xts, stats=_S) or e["liq"], stats=_S) + f
     return r - c_in - c_out
 
 
@@ -321,6 +343,7 @@ FILTERS = [
 
 def main():
     solat = load_sol()
+    load_dex()
     ents = load_entries(solat)
     if os.environ.get("DEDUP", "1") == "1":
         by = {}

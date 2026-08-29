@@ -12,18 +12,34 @@ understates consumption by ~30%). But ST serves ARBITRARY HISTORICAL WINDOWS (ve
 so control paths never need continuous polling: fetch them once, on demand, only for the controls a
 study actually uses. That turns an open-ended drain into a bounded one-off cost.
 
-WHAT IT SELECTS
----------------
-Launches that had NOT trended as of their sampling moment, aged so that a full pre-event profile is
-computable: the Stage-1 feature set needs a 60-minute baseline plus the lead, so a control must be at
-least PRE_MIN_H old. Sampled at RANDOM within that band — picking the most active launches would
-bias the very comparison this arm exists to support.
+TWO STAGES, BECAUSE CHARTING BLIND IS 14x TOO EXPENSIVE
+------------------------------------------------------
+Measured on 729 backfilled controls: the median pump.fun launch produces only 4 minute-bars and just
+**2%** reach the >=25 bars the feature set needs. Charting at random therefore burns ~50 credits per
+usable control. So:
+
+  1. SCREEN  — POST /tokens/multi, 20 launches per call, ONE credit per batch. Returns
+               txns{buys,sells,total,volume}, liquidity and multi-window events. Results are stored
+               on pump_launches (screened_at / screen_txns / screen_vol / screen_liq) so eligibility
+               is auditable and never re-paid for.
+  2. CHART   — /chart only for launches passing the pre-registered activity bar, 1 credit each.
+
+That is ~14x more efficient. It also makes the eligibility filter EXPLICIT rather than letting a
+bar-count threshold silently do the same filtering after the fact. The honest risk set is
+"launches that sustained real trading activity", not "all launches" — 98% of launches trade for a
+few minutes and die, and rejecting those is trivial, not the discrimination a detector needs. The
+SAME bar must be applied to the case arm when the comparison is run.
+
+Within the eligible set, controls are taken at RANDOM — picking the most active would bias the very
+comparison this arm exists to support.
 
 Writes into `trending_bars` (same schema as the GeckoTerminal path), so every downstream analysis
 works unchanged and cases/controls share one substrate.
 
 Env: SUPABASE_URL, SUPABASE_KEY, SOLANA_TRACKER_KEY.
-     MAX_CALLS (default 150), CREDIT_FLOOR (default 1200), PRE_MIN_H (default 2), POST_H (default 6),
+     MAX_CALLS (default 150) — chart calls only; screening is budgeted separately and is ~1/20th
+     the cost. CREDIT_FLOOR (default 1200), PRE_MIN_H (default 2), POST_H (default 6),
+     SCREEN_MIN_TXNS (default 30) — the pre-registered activity bar,
      SLEEP (default 0.45 -> ~2.2 req/s, under the 3 req/s free-tier limit).
 """
 import json, os, random, time, urllib.request, urllib.error
@@ -37,6 +53,8 @@ CREDIT_FLOOR = int(os.environ.get("CREDIT_FLOOR", "1200"))
 PRE_MIN_H = float(os.environ.get("PRE_MIN_H", "2"))
 POST_H = float(os.environ.get("POST_H", "6"))
 SLEEP = float(os.environ.get("SLEEP", "0.45"))
+SCREEN_MIN_TXNS = int(os.environ.get("SCREEN_MIN_TXNS", "30"))
+SCREEN_BATCH = 20
 
 
 def sb(method, path, body=None, prefer=None):
@@ -107,6 +125,49 @@ def chart(mint, fr, to):
     return None
 
 
+def screen(mints):
+    """One credit per 20 mints. Returns {mint: (txns_total, volume, liquidity_usd)}."""
+    url = "https://data.solanatracker.io/tokens/multi"
+    body = json.dumps({"tokens": mints}).encode()
+    h = dict(ST_H, **{"Content-Type": "application/json"})
+    j = None
+    for a in range(3):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=h, data=body,
+                                                               method="POST"), timeout=45) as x:
+                j = json.loads(x.read())
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(3 * (a + 1)); continue
+            return {}
+        except Exception:
+            time.sleep(1.5)
+    if j is None:
+        return {}
+    tok = j.get("tokens") if isinstance(j, dict) else j
+    if isinstance(tok, dict):
+        entries = list(tok.items())
+    elif isinstance(tok, list):
+        entries = [(((v.get("token") or {}).get("mint")) or (v.get("pools") or [{}])[0].get("tokenAddress"), v)
+                   for v in tok if isinstance(v, dict)]
+    else:
+        return {}
+    out = {}
+    for k, v in entries:
+        if not isinstance(v, dict):
+            continue
+        pools = v.get("pools") or []
+        p0 = pools[0] if pools else {}
+        t = p0.get("txns") or {}
+        mint = k or p0.get("tokenAddress")
+        if not mint:
+            continue
+        out[mint] = (t.get("total") or 0, t.get("volume") or 0.0,
+                     ((p0.get("liquidity") or {}).get("usd")) or 0.0)
+    return out
+
+
 def main():
     c0 = credits()
     print(f"Solana Tracker credits at start: {c0}", flush=True)
@@ -121,13 +182,47 @@ def main():
     have = {r["mint"] for r in sb_all("/trending_bar_coverage?select=mint")}
     now = time.time()
     lo, hi = int(now - 24 * 3600), int(now - PRE_MIN_H * 3600)
-    cand = [r for r in sb_all("/pump_launches?select=mint,created_at"
+    pool = [r for r in sb_all("/pump_launches?select=mint,created_at,screened_at,screen_txns"
                               f"&created_at=gte.{lo}&created_at=lte.{hi}&order=created_at.asc")
             if r["mint"] not in cased and r["mint"] not in have]
     random.seed(int(now) // 3600)
-    random.shuffle(cand)                      # RANDOM, not most-active — else the arm is biased
-    cand = cand[:budget]
-    print(f"eligible controls without bars: {len(cand)} queued", flush=True)
+    random.shuffle(pool)                      # RANDOM, not most-active — else the arm is biased
+
+    # ---- STAGE 1: screen, 1 credit per 20 ----
+    unscreened = [r for r in pool if not r.get("screened_at")]
+    screen_batches = int(os.environ.get("SCREEN_BATCHES", "40"))
+    screened, spend_screen = {}, 0
+    for i in range(0, min(len(unscreened), screen_batches * SCREEN_BATCH), SCREEN_BATCH):
+        chunk = [r["mint"] for r in unscreened[i:i + SCREEN_BATCH]]
+        res = screen(chunk); spend_screen += 1
+        time.sleep(SLEEP)
+        # created_at MUST be included: PostgREST upsert is INSERT..ON CONFLICT, so the insert half
+        # still has to satisfy NOT NULL even when the row already exists. Omitting it made every
+        # screen write fail silently while the run reported success.
+        cmap = {r["mint"]: r["created_at"] for r in unscreened[i:i + SCREEN_BATCH]}
+        st_, _ = sb("POST", "/pump_launches?on_conflict=mint",
+                    [{"mint": m, "created_at": cmap[m], "screened_at": int(time.time()),
+                      "screen_txns": res.get(m, (0, 0.0, 0.0))[0],
+                      "screen_vol": res.get(m, (0, 0.0, 0.0))[1],
+                      "screen_liq": res.get(m, (0, 0.0, 0.0))[2]} for m in chunk],
+                    prefer="resolution=merge-duplicates,return=minimal")
+        if not (st_ and 200 <= st_ < 300):
+            print(f"!! screen write FAILED status={st_} — aborting rather than re-paying next run",
+                  flush=True)
+            return
+        screened.update(res)
+    active = {m: v for m, v in screened.items() if v[0] >= SCREEN_MIN_TXNS}
+    print(f"screened {len(screened)} launches for {spend_screen} credits -> {len(active)} passed "
+          f"the >={SCREEN_MIN_TXNS}-txn bar ({len(active)/max(1,len(screened))*100:.0f}%)", flush=True)
+
+    # ---- STAGE 2: chart ONLY the active ones ----
+    bym = {r["mint"]: r["created_at"] for r in pool}
+    already = [r for r in pool if (r.get("screen_txns") or 0) >= SCREEN_MIN_TXNS]
+    cand = ([{"mint": m, "created_at": bym[m]} for m in active if m in bym]
+            + [r for r in already if r["mint"] not in active])
+    random.shuffle(cand)
+    cand = cand[:max(0, budget - spend_screen)]
+    print(f"charting {len(cand)} ACTIVE controls", flush=True)
 
     rows, done, empty = [], 0, 0
     for r in cand:

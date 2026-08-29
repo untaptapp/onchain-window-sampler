@@ -221,10 +221,16 @@ def main():
             # and broke the age covariate while fixing observability. Cover the whole case range and
             # let the analysis do the matching.
             lo, hi = int(now_s - 24*3600), int(now_s - 5*60)
+            # Do NOT exclude mints that later trended. Risk-set sampling requires a token be usable
+            # as a control at timestamps BEFORE it became a case — excluding "future cases" uses
+            # information unavailable at sampling time and biases the comparison, because the
+            # control pool then means "never trended" rather than "had not trended YET". Whether a
+            # mint is an eligible control at a given moment is an ANALYSIS-time decision
+            # (eligible iff first_trend > t), not a collection-time filter.
             for r in sb_all("/pump_launches?select=mint,created_at"
                             f"&created_at=gte.{lo}&created_at=lte.{hi}&order=created_at.asc"):
                 m = r.get("mint")
-                if m and m not in first:
+                if m:
                     controls[m] = r["created_at"]
             # paginate the WHOLE universe: `limit=1000` is silently capped by PostgREST and covers
             # only the last few sweeps, so the control pool collapsed to a few dozen mints drawn

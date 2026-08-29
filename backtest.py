@@ -108,39 +108,71 @@ def load_sol():
 
 
 # ---- exit rules: all simulated on minute bars with intra-bar high/low ----------------------
+# Every trade must close at a FIXED, TRADEABLE horizon. Without one, a rule that never fires was
+# silently marked to market at the last collected bar and returned as though it were a closed trade
+# — with no flag and no counter. That is censoring, and it flattered results in exactly one
+# direction: these tokens decay, so a path scored before its drawdown completes looks better than it
+# ends up. It was 60.5% of Track A, whose real (rule-fired) median was -40.7% against -7.6% for the
+# marked-to-market group. It also made results drift as bars accumulated overnight, since censored
+# paths kept resolving downward.
+#
+# The horizon cannot exceed the collected window: trending_bars.py stores POST_H=3 hours after first
+# sighting, a budget decision made for a fast exit rule ("MFE peaks around 52 min") that silently
+# invalidated the slower rule chosen later. Raise POST_H first if this needs to be longer.
+HORIZON_H = float(os.environ.get("HORIZON_H", "3"))
+_HW = None            # newest bar timestamp anywhere = how far the collectors have actually got
+
+
+def set_horizon_mark(bars_by_mint):
+    """Collector high-water mark, so 'the path stopped' can be told from 'we have not collected it
+    yet'. A token that stopped trading is a REAL outcome (exit at the last price it traded); a token
+    whose window simply has not elapsed is NOT a closed trade and must be dropped."""
+    global _HW
+    _HW = max((b[-1][0] for b in bars_by_mint.values() if b), default=None)
+    return _HW
+
+
 def simulate(bars, rule):
-    """bars: [(ts,o,h,l,c)] from entry. Returns (gross_return_usd_terms, exit_ts).
-    Within a bar the LOW is assumed hit before the HIGH — stops fill before targets."""
+    """bars: [(ts,o,h,l,c)] from entry. Returns (gross_return, exit_ts, closed).
+    Within a bar the LOW is assumed hit before the HIGH — stops fill before targets.
+    `closed` is False when the horizon has not elapsed in the data yet: an OPEN position, which
+    callers must drop rather than score."""
     if len(bars) < 2:
-        return None, None
+        return None, None, False
     p0 = bars[0][4]
     if not p0 or p0 <= 0:
-        return None, None
+        return None, None, False
+    horizon_ts = bars[0][0] + HORIZON_H * 3600
     kind = rule["kind"]
     peak = p0
     banked = 0.0
     frac_left = 1.0
     for (ts, o, h, l, c) in bars[1:]:
+        if ts >= horizon_ts:                      # hard time exit — a real, placeable order
+            r = c / p0 - 1
+            if kind == "partial" and frac_left < 1.0:
+                r = banked + frac_left * r
+            return r, ts, True
         if kind == "stop_tp":
             if l <= p0 * (1 - rule["sl"]):
-                return -rule["sl"], ts
+                return -rule["sl"], ts, True
             if h >= p0 * (1 + rule["tp"]):
-                return rule["tp"], ts
+                return rule["tp"], ts, True
         elif kind == "trail":
             w = rule["w"]
             if l <= peak * (1 - w):
-                return max(l, peak * (1 - w)) / p0 - 1, ts
+                return max(l, peak * (1 - w)) / p0 - 1, ts, True
             peak = max(peak, h)
         elif kind == "stop_trail":
             if l <= p0 * (1 - rule["sl"]):
-                return -rule["sl"], ts
+                return -rule["sl"], ts, True
             if peak > p0 * (1 + rule["arm"]) and l <= peak * (1 - rule["w"]):
-                return max(l, peak * (1 - rule["w"])) / p0 - 1, ts
+                return max(l, peak * (1 - rule["w"])) / p0 - 1, ts, True
             peak = max(peak, h)
         elif kind == "partial":
             # bank `frac` at +tp, trail the remainder; hard stop until the TP arms
             if frac_left == 1.0 and l <= p0 * (1 - rule["sl"]):
-                return -rule["sl"], ts
+                return -rule["sl"], ts, True
             if frac_left == 1.0 and h >= p0 * (1 + rule["tp"]):
                 banked = rule["frac"] * rule["tp"]
                 frac_left = 1 - rule["frac"]
@@ -148,18 +180,22 @@ def simulate(bars, rule):
                 continue
             if frac_left < 1.0:
                 if l <= peak * (1 - rule["w"]):
-                    return banked + frac_left * (max(l, peak * (1 - rule["w"])) / p0 - 1), ts
+                    return banked + frac_left * (max(l, peak * (1 - rule["w"])) / p0 - 1), ts, True
                 peak = max(peak, h)
         elif kind == "time":
             if ts - bars[0][0] >= rule["mins"] * 60:
-                return c / p0 - 1, ts
+                return c / p0 - 1, ts, True
             if rule.get("sl") and l <= p0 * (1 - rule["sl"]):
-                return -rule["sl"], ts
+                return -rule["sl"], ts, True
     last = bars[-1]
     r = last[4] / p0 - 1
     if kind == "partial" and frac_left < 1.0:
         r = banked + frac_left * r
-    return r, last[0]
+    # The rule never fired. Two very different reasons, and conflating them was the defect:
+    #   - the token stopped trading before the horizon  -> a real exit at the last traded price
+    #   - the horizon simply has not elapsed yet        -> an OPEN position; not a closed trade
+    closed = _HW is None or horizon_ts <= _HW
+    return r, last[0], closed
 
 
 RULES = [
@@ -223,7 +259,10 @@ def load_entries(solat):
         bars[b["mint"]].append((b["ts"], b["o"], b["h"], b["l"], b["c"]))
     for m in bars:
         bars[m].sort()
-    print(f"bars: {len(bars_raw):,} rows across {len(bars):,} mints", flush=True)
+    hw = set_horizon_mark(bars)
+    print(f"bars: {len(bars_raw):,} rows across {len(bars):,} mints "
+          f"| horizon {HORIZON_H}h, collector high-water {time.strftime('%Y-%m-%d %H:%M', time.gmtime(hw))}Z",
+          flush=True)
     ents = []
     dropped = defaultdict(int)
     for src in ("gmgn", "solanatracker", "geckoterminal"):
@@ -304,16 +343,20 @@ def liq_at(ls, ts, stats=None):
 
 
 def gross_return(e, rule, solat):
-    g, xts = simulate(e["bars"], rule)
-    if g is None:
+    g, xts, closed = simulate(e["bars"], rule)
+    if g is None or not closed:
+        if g is not None: _S["open_position"] += 1
         return None
     a, b = solat(e["t0"]), solat(xts)
     return ((1 + g) * (a / b) - 1) if (a and b) else g
 
 
 def net_return(e, rule, solat):
-    g, xts = simulate(e["bars"], rule)
+    g, xts, closed = simulate(e["bars"], rule)
     if g is None:
+        return None
+    if not closed:
+        _S["open_position"] += 1     # horizon not yet elapsed: an open trade, not a result
         return None
     a, b = solat(e["t0"]), solat(xts)
     if not (a and b):

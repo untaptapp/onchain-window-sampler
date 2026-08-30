@@ -37,17 +37,34 @@ ENTRY_TOL_MIN = float(os.environ.get("ENTRY_TOL_MIN", "5"))
 _S = defaultdict(int)          # fallback counters — every silent path must be countable
 
 
-def sb_all(path, page=1000, cap=800000):
+def sb_all(path, page=1000, cap=800000, tries=5):
     out = []
     while len(out) < cap:
         h = {"apikey": KEY, "Authorization": f"Bearer {KEY}",
              "Range-Unit": "items", "Range": f"{len(out)}-{len(out) + page - 1}"}
-        try:
-            with urllib.request.urlopen(urllib.request.Request(SB + path, headers=h), timeout=120) as r:
-                t = r.read(); chunk = json.loads(t) if t else []
-        except urllib.error.HTTPError as e:
-            if e.code == 416: break
-            raise
+        chunk = None
+        for attempt in range(tries):
+            try:
+                with urllib.request.urlopen(urllib.request.Request(SB + path, headers=h), timeout=120) as r:
+                    t = r.read(); chunk = json.loads(t) if t else []
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 416:
+                    chunk = []
+                    break
+                # A 5xx is transient; a 4xx is a real answer and must not be retried into silence.
+                # trending_bars is ~600k rows = ~600 sequential page requests, so a single bad page
+                # aborted a 10-minute analysis run. Retry the page, and fail LOUD if it never lands
+                # rather than returning a short list that reads as "the table is small".
+                if e.code < 500 or attempt == tries - 1:
+                    raise
+                time.sleep(3 * (attempt + 1))
+            except Exception:
+                if attempt == tries - 1:
+                    raise
+                time.sleep(3 * (attempt + 1))
+        if chunk is None:
+            raise RuntimeError(f"sb_all: page at offset {len(out)} never returned for {path[:60]}")
         if not chunk: break
         out += chunk
         if len(chunk) < page: break

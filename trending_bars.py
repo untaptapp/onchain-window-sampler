@@ -289,7 +289,30 @@ def main():
         # catching up, so the freshest data — the data a forward test is made of — was always the
         # last to arrive. GeckoTerminal serves full history, so the backlog loses nothing by waiting;
         # a fresh sighting waiting is a fresh sighting we cannot act on.
-        todo = sorted(first.items(), key=lambda kv: (have[kv[0]][2], -kv[1]))
+        def deficit(m, t0):
+            """Seconds of the NEEDED window not yet collected. This is the scheduling key."""
+            need_from = t0 - PRE_MIN * 60
+            need_to = min(now, t0 + (LONG_POST_H if m in long_post else POST_H) * 3600)
+            cov = have[m]
+            if cov[0] is None:
+                return need_to - need_from                  # nothing collected: the whole window
+            return max(0, need_to - cov[1]) + max(0, cov[0] - need_from)
+
+        # MOST-INCOMPLETE FIRST, measured in seconds of missing window — not in bar COUNT.
+        #
+        # Sorting on n_bars ascending (the previous key) starved exactly the mints that matter most.
+        # A mint whose window is still OPEN needs re-fetching every pass to extend it, but by then it
+        # already has hundreds of bars, so it sorted behind every thin mint in the table and a finite
+        # call budget never reached it. Measured consequence: the newest bar in the whole table sat
+        # frozen at 22:02Z for 4.9 hours while the collector ran, because new mints were being
+        # covered and no existing window was ever extended. Coverage looked fine (91.6%); recency
+        # was dead. Raising POST_H 3h->6h and LONG_POST_H 12h->24h made it worse, since windows now
+        # stay open far longer and therefore need far more extension passes.
+        #
+        # Seconds-of-missing-window handles both cases in one number: a brand-new mint is missing its
+        # entire window, an open window is missing only what has elapsed since the last fetch, and
+        # whichever is further from complete goes first.
+        todo = sorted(first.items(), key=lambda kv: -deficit(kv[0], kv[1]))
         ctrl_todo = list(controls.items())
         # INTERLEAVE, don't append. Concatenating controls after every case made them structurally
         # unreachable: with hundreds of cases queued ahead of them, no finite call budget ever

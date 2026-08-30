@@ -221,7 +221,8 @@ def main():
                                                f"&age_s=gte.{LONG_AGE_S}")}
         print(f"long post window ({LONG_POST_H}h): {len(long_post)} mints; "
               f"{POST_H}h for the rest", flush=True)
-        pools = {p["mint"]: p for p in sb_all("/trending_pools?select=mint,pool_address,ok")}
+        pools = {p["mint"]: p for p in
+                 sb_all("/trending_pools?select=mint,pool_address,ok,last_fetch_to")}
         # Coverage from a server-side aggregate view. Deriving per-mint min/max/count by scanning
         # every bar row client-side is O(all bars) on EVERY pass — it already timed out at 122k
         # rows and would only get worse as the table grows.
@@ -294,9 +295,16 @@ def main():
             need_from = t0 - PRE_MIN * 60
             need_to = min(now, t0 + (LONG_POST_H if m in long_post else POST_H) * 3600)
             cov = have[m]
+            # Credit the furthest point we have ALREADY REQUESTED, not merely the furthest bar we
+            # received. A token that stopped trading returns no bars past its final trade, so its
+            # deficit measured on bars alone never shrinks — it stays at the head of the queue and is
+            # re-fetched every pass, forever, for nothing. Measured: 651 of 795 open windows belonged
+            # to mints with no board sighting in 2h+, i.e. ~82% of all extension work was spent on
+            # tokens that can never produce another bar.
+            tried = (pools.get(m) or {}).get("last_fetch_to") or 0
             if cov[0] is None:
-                return need_to - need_from                  # nothing collected: the whole window
-            return max(0, need_to - cov[1]) + max(0, cov[0] - need_from)
+                return max(0, need_to - max(need_from, tried))
+            return max(0, need_to - max(cov[1], tried)) + max(0, cov[0] - need_from)
 
         # MOST-INCOMPLETE FIRST, measured in seconds of missing window — not in bar COUNT.
         #
@@ -341,10 +349,12 @@ def main():
             if calls["n"] >= MAX_CALLS:
                 break
             p = pools.get(mint)
+            newly = False
             if p is None:
                 p = resolve_pool(mint)
                 new_pools.append(p)
                 pools[mint] = p
+                newly = True
             if not p.get("ok") or not p.get("pool_address"):
                 continue
             need_from = t0 - PRE_MIN * 60
@@ -354,6 +364,14 @@ def main():
             if cov[0] is not None and cov[0] <= need_from + 180 and cov[1] >= need_to - 180:
                 continue
             bars = fetch_bars(p["pool_address"], need_from, need_to)
+            # Remember how far we asked, so a dead token's deficit collapses after ONE attempt
+            # instead of re-queuing at the head of the list on every pass.
+            # A pool resolved THIS iteration is already in new_pools by reference, so mutating it
+            # is enough — appending again would put the same mint twice in one upsert batch, which
+            # Postgres rejects ("ON CONFLICT DO UPDATE cannot affect row a second time").
+            p["last_fetch_to"] = int(need_to)
+            if not newly:
+                new_pools.append({"mint": mint, "last_fetch_to": int(need_to)})
             for b in bars:
                 new_bars.append({"mint": mint, "ts": int(b[0]), "o": b[1], "h": b[2],
                                  "l": b[3], "c": b[4], "vol": b[5]})

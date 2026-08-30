@@ -44,10 +44,33 @@ EXTRA_KEYS = ["price_change_percent1m", "price_change_percent5m", "price_change_
               "burn_ratio", "cto_flag", "is_og", "history_highest_market_cap",
               # EVM-only (Robinhood Chain and other EVM boards). Absent from Solana responses, and
               # the comprehension below is keyed on `k in it`, so Solana rows are unaffected.
-              # These are the EVM analogue of rug risk and have no Solana equivalent: measured on
-              # the robinhood board, all 100/100 rows populate them.
+              # NOT the "EVM analogue of rug risk" they were first taken for: measured over all
+              # 6,500 collected gmgn_rh rows, is_honeypot / is_open_source / is_renounced are
+              # CONSTANT (0 / 1 / 1) and carry zero information; buy_tax and sell_tax are 0 on
+              # 95.7%; lock_percent is 0.95 on 91%. Populated is not informative — keep collecting
+              # them, but see research/sybil-ladder-defense.md before using any of them as a gate.
               "is_honeypot", "buy_tax", "sell_tax", "is_open_source", "is_renounced",
-              "lock_percent", "launchpad", "gas_fee", "top70_sniper_hold_rate"]
+              "lock_percent", "launchpad", "gas_fee", "top70_sniper_hold_rate",
+              # Added 2026-08-30 after the revival-rug case study (research/sybil-ladder-defense.md).
+              # All were already in the rank payload and were being discarded. Board history cannot
+              # be backfilled, so an un-lifted field is permanently lost for every interval we ran
+              # without it. All 18 populate on BOTH chains (verified against live rank responses).
+              # Live pulls, n=100/chain, re-verified independently on a second pull: bot_degen_rate
+              # p50 0.39-0.42 rh / 0.29-0.30 sol (the sybil-ladder signature); creator_close True on
+              # ~48% rh / ~73% sol; image_dup nonzero on 37-46% either chain;
+              # twitter_create_token_count max ~1,200 rh / 4,645 sol. One Solana deployer held 5-8
+              # of the 100 board slots at once — the exact count moves with board churn, so treat it
+              # as "one deployer routinely holds several percent of the board", not as a constant.
+              # 17 of the 18 carry real variance; `is_show_alert` came back CONSTANT on both chains
+              # (distinct=1, n=100 each), so it is collected for completeness but is subject to the
+              # same warning as the block above — populated is not informative.
+              # Cost: ~4 MB/day across both chains.
+              # `total_supply` is here because mcap must be derivable from a point-in-time price.
+              "creator", "creator_close", "creator_token_status", "bot_degen_count",
+              "bot_degen_rate", "dev_team_hold_rate", "dev_token_burn_ratio", "initial_liquidity",
+              "total_supply", "image_dup", "twitter_dup", "website_dup", "telegram_dup",
+              "twitter_create_token_count", "twitter_rename_count", "twitter_change_flag",
+              "twitter_del_post_token_count", "is_show_alert"]
 
 
 def sb(method, path, body=None, prefer=None):

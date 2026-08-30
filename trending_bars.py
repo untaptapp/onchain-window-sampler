@@ -346,6 +346,17 @@ def main():
         # whichever is further from complete goes first.
         # Ties (everything at the cap) break on OLDEST-DATA-FIRST, which is a fair round-robin:
         # whoever has gone longest without a successful fetch or an attempt goes next.
+        def flush_pools(rows, attempts):
+            """Two uniform batches, never one mixed one — and CHECK the status, because this write
+            failing silently is what hid the bug."""
+            for batch, path in ((rows, "resolutions"), (attempts, "attempts")):
+                for i in range(0, len(batch), 500):
+                    st, _ = sb("POST", "/trending_pools?on_conflict=mint", batch[i:i + 500],
+                               prefer="resolution=merge-duplicates,return=minimal")
+                    if st >= 300:
+                        print(f"!! trending_pools {path} write FAILED {st} "
+                              f"({len(batch[i:i+500])} rows)", flush=True)
+
         def staleness(m):
             return max(have[m][1] or 0, (pools.get(m) or {}).get("last_fetch_to") or 0)
 
@@ -373,7 +384,12 @@ def main():
               f"at {UNIVERSE_FRAC:.0%} of the budget", flush=True)
         print(f"universe {len(first)} mints · {len(pools)} pools cached · "
               f"{sum(1 for m in first if have[m][2])} with bars · budget {MAX_CALLS}", flush=True)
-        new_pools, new_bars, done = [], [], 0
+        # Attempt records are kept in their OWN batch. PostgREST rejects a bulk upsert whose objects
+        # have different key sets — "PGRST102: All object keys must match" — so mixing a full
+        # resolve_pool record with a two-key attempt record 400s the ENTIRE batch. That failure was
+        # silent (the pools write ignores its status), and it took the newly resolved pools down with
+        # it, so every resolution was lost and re-paid for on the next pass.
+        new_pools, new_attempts, new_bars, done = [], [], [], 0
         for mint, t0 in todo:
             if calls["n"] >= MAX_CALLS:
                 break
@@ -400,7 +416,7 @@ def main():
             # Postgres rejects ("ON CONFLICT DO UPDATE cannot affect row a second time").
             p["last_fetch_to"] = int(need_to)
             if not newly:
-                new_pools.append({"mint": mint, "last_fetch_to": int(need_to)})
+                new_attempts.append({"mint": mint, "last_fetch_to": int(need_to)})
             for b in bars:
                 new_bars.append({"mint": mint, "ts": int(b[0]), "o": b[1], "h": b[2],
                                  "l": b[3], "c": b[4], "vol": b[5]})
@@ -411,15 +427,11 @@ def main():
                        prefer="resolution=merge-duplicates,return=minimal")
                 # flush pools on the SAME cadence — writing them only at end-of-pass meant an
                 # interrupted run lost every resolution and re-paid for it on the next pass
-                for i in range(0, len(new_pools), 500):
-                    sb("POST", "/trending_pools?on_conflict=mint", new_pools[i:i + 500],
-                       prefer="resolution=merge-duplicates,return=minimal")
+                flush_pools(new_pools, new_attempts)
                 print(f"  .. {done} mints, {len(new_bars)} bars + {len(new_pools)} pools flushed, "
                       f"{calls['n']} calls", flush=True)
-                new_bars, new_pools = [], []
-        for i in range(0, len(new_pools), 500):
-            sb("POST", "/trending_pools?on_conflict=mint", new_pools[i:i + 500],
-               prefer="resolution=merge-duplicates,return=minimal")
+                new_bars, new_pools, new_attempts = [], [], []
+        flush_pools(new_pools, new_attempts)
         for i in range(0, len(new_bars), 500):
             sb("POST", "/trending_bars?on_conflict=mint,ts", new_bars[i:i + 500],
                prefer="resolution=merge-duplicates,return=minimal")

@@ -70,6 +70,8 @@ POST_H = float(os.environ.get("POST_H", "6"))
 # unknown, which coalesce() turns into a 1970 creation date; see trending_mint_age.
 LONG_POST_H = float(os.environ.get("LONG_POST_H", "24"))
 LONG_AGE_S = 86400
+# Max hours of missing window any single mint may claim when competing for the call budget.
+DEFICIT_CAP_H = float(os.environ.get("DEFICIT_CAP_H", "6"))
 # Which snapshot sources are Solana. See the allowlist note in main().
 SOL_SOURCES = os.environ.get("SOL_SOURCES", "gmgn,solanatracker,geckoterminal,fomoscan")
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))
@@ -206,12 +208,14 @@ def main():
         # next chain we add fails closed — invisible to this collector until deliberately included.
         snaps = sb_all(f"/trending_snapshots?source=in.({SOL_SOURCES})"
                        "&select=mint,captured_at&order=captured_at.asc")
-        first, nobs = {}, defaultdict(int)
+        first, last, nobs = {}, {}, defaultdict(int)
         for r in snaps:
             m, t = r["mint"], r["captured_at"] / 1000
             nobs[m] += 1
             if m not in first or t < first[m]:
                 first[m] = t
+            if m not in last or t > last[m]:
+                last[m] = t
         # a mint seen once has no path to model — never spend GT calls on it
         first = {m: t for m, t in first.items() if nobs[m] >= MIN_OBS}
         # Which mints get the long post window. Read from the trending_mint_age VIEW, which is the
@@ -290,10 +294,23 @@ def main():
         # catching up, so the freshest data — the data a forward test is made of — was always the
         # last to arrive. GeckoTerminal serves full history, so the backlog loses nothing by waiting;
         # a fresh sighting waiting is a fresh sighting we cannot act on.
+        def window_end(m, t0):
+            """End of the window we must collect for `m`.
+
+            Anchored on the mint's LAST trending sighting, not its first. A token can trend, go
+            quiet, and trend again — which is precisely Track A's "revival" thesis — and anchoring
+            on the first sighting alone stops collecting at first+POST_H, so the second episode gets
+            NO bars. Measured: 322 of 4,558 mints had an episode more than 24h after their first
+            sighting. prune_trending_bars already RETAINS to max(anchors)+post_h, so the collector
+            was leaving a window the pruner keeps permanently unfilled — collector and pruner must
+            agree on the window (guardrail C0c) or one of them is doing nothing useful."""
+            span = (LONG_POST_H if m in long_post else POST_H) * 3600
+            return min(now, max(t0, last.get(m, t0)) + span)
+
         def deficit(m, t0):
             """Seconds of the NEEDED window not yet collected. This is the scheduling key."""
             need_from = t0 - PRE_MIN * 60
-            need_to = min(now, t0 + (LONG_POST_H if m in long_post else POST_H) * 3600)
+            need_to = window_end(m, t0)
             cov = have[m]
             # Credit the furthest point we have ALREADY REQUESTED, not merely the furthest bar we
             # received. A token that stopped trading returns no bars past its final trade, so its
@@ -303,8 +320,15 @@ def main():
             # tokens that can never produce another bar.
             tried = (pools.get(m) or {}).get("last_fetch_to") or 0
             if cov[0] is None:
-                return max(0, need_to - max(need_from, tried))
-            return max(0, need_to - max(cov[1], tried)) + max(0, cov[0] - need_from)
+                d = max(0, need_to - max(need_from, tried))
+            else:
+                d = max(0, need_to - max(cov[1], tried)) + max(0, cov[0] - need_from)
+            # CAP the deficit. Anchoring on the last sighting recovers a median +5.5h of window and
+            # a p90 of +33.6h — but an uncapped 33h tail gap outranks a brand-new mint that needs
+            # only its first 3h, which is precisely the data the pre-registered forward test
+            # consumes. Capping bounds how much any one mint can dominate; the tail still gets
+            # collected, just not ahead of everything else.
+            return min(d, DEFICIT_CAP_H * 3600)
 
         # MOST-INCOMPLETE FIRST, measured in seconds of missing window — not in bar COUNT.
         #
@@ -320,7 +344,12 @@ def main():
         # Seconds-of-missing-window handles both cases in one number: a brand-new mint is missing its
         # entire window, an open window is missing only what has elapsed since the last fetch, and
         # whichever is further from complete goes first.
-        todo = sorted(first.items(), key=lambda kv: -deficit(kv[0], kv[1]))
+        # Ties (everything at the cap) break on OLDEST-DATA-FIRST, which is a fair round-robin:
+        # whoever has gone longest without a successful fetch or an attempt goes next.
+        def staleness(m):
+            return max(have[m][1] or 0, (pools.get(m) or {}).get("last_fetch_to") or 0)
+
+        todo = sorted(first.items(), key=lambda kv: (-deficit(kv[0], kv[1]), staleness(kv[0])))
         ctrl_todo = list(controls.items())
         # INTERLEAVE, don't append. Concatenating controls after every case made them structurally
         # unreachable: with hundreds of cases queued ahead of them, no finite call budget ever
@@ -358,7 +387,7 @@ def main():
             if not p.get("ok") or not p.get("pool_address"):
                 continue
             need_from = t0 - PRE_MIN * 60
-            need_to = min(now, t0 + (LONG_POST_H if mint in long_post else POST_H) * 3600)
+            need_to = window_end(mint, t0)
             cov = have[mint]
             # already covered (allow a 3-bar edge tolerance)
             if cov[0] is not None and cov[0] <= need_from + 180 and cov[1] >= need_to - 180:

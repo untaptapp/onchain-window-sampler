@@ -10,7 +10,12 @@ name: materialize-paths
 # trade that POST_H=3 made silently and wrongly. Set it deliberately.
 on:
   schedule:
-    - cron: '25 */2 * * *'
+    # Hourly, not 2-hourly. GitHub silently DROPS scheduled runs under load -- this job missed both
+    # its 00:25 and 02:25 slots on 2026-08-30, leaving the forward-test sample stale by 4h with no
+    # error anywhere. Materialisation is the only thing that turns bars into evaluable outcomes, so
+    # a missed run directly delays the pre-registered test. Hourly gives the schedule slack to
+    # absorb a dropped slot; the job is idempotent and cheap.
+    - cron: '25 * * * *'
   workflow_dispatch:
     inputs:
       keep_days:

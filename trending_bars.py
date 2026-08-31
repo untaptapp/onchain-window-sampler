@@ -516,21 +516,30 @@ def main():
         unres = [m for m, _ in todo if m not in pools]
         if unres:
             cap = int(os.environ.get("RESOLVE_CALLS", "120")) * 30
-            queued, got_ok = [], 0
+            # Flush every FLUSH_EVERY records, NOT at the end of the loop. 120 calls is several
+            # minutes of wall time, and holding every resolution until then is the same "an
+            # interrupted run loses what it just paid for" failure this is supposed to avoid —
+            # it also makes the run look completely idle from the database side while it works.
+            queued, got_ok, nres, ncalls = [], 0, 0, 0
+            FLUSH_EVERY = 300
             for i in range(0, min(len(unres), cap), 30):
                 if calls["n"] >= MAX_CALLS or (t_end and time.time() >= t_end):
                     break
                 recs = resolve_pools_batch(unres[i:i + 30])
+                ncalls += 1
                 for m, rec in recs.items():
                     pools[m] = rec
                     queued.append(rec)
                     got_ok += 1 if rec["ok"] else 0
-            # Write them NOW rather than carrying them to the first bar flush: an interrupted run
-            # otherwise loses every resolution it just paid for.
-            flush_pools(queued, [])
-            print(f"  batch-resolved {len(queued)} pools ({got_ok} ok) in "
-                  f"{(len(queued) + 29) // 30} calls; {len(unres) - len(queued)} still unresolved",
-                  flush=True)
+                nres += len(recs)
+                if len(queued) >= FLUSH_EVERY:
+                    flush_pools(queued, []); queued.clear()
+                    print(f"  .. batch-resolved {nres} pools ({got_ok} ok) in {ncalls} calls",
+                          flush=True)
+            if queued:
+                flush_pools(queued, []); queued.clear()
+            print(f"  batch-resolved {nres} pools ({got_ok} ok) in {ncalls} calls; "
+                  f"{len(unres) - nres} still unresolved", flush=True)
         print(f"universe {len(first)} mints · {len(pools)} pools cached · "
               f"{sum(1 for m in first if have[m][2])} with bars · budget {MAX_CALLS}", flush=True)
         # Attempt records are kept in their OWN batch. PostgREST rejects a bulk upsert whose objects

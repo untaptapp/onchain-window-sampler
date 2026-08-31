@@ -270,7 +270,20 @@ def ff(v):
 
 def load_entries(solat):
     """One entry per (source, mint): board features at first sighting + minute bars after it."""
-    bars_raw = sb_all("/trending_bars?select=mint,ts,o,h,l,c&order=ts.asc")
+    # Read bars in CHUNKS OF MINTS, never by deep offset.
+    #
+    # `order=ts.asc` with Range offsets made PostgREST sort ~914k rows for every one of ~900 pages,
+    # and past ~400k the statement exceeded the timeout: every read failed with 57014 and took the
+    # whole analysis with it. Filtering by a batch of mints turns each request into an index range
+    # scan on the (mint, ts) primary key — bounded work per request, independent of table size, and
+    # it never pages past what it asks for.
+    mint_rows = sb_all("/trending_pools?select=mint&ok=is.true&order=mint.asc")
+    all_mints = [r["mint"] for r in mint_rows]
+    bars_raw, CH = [], int(os.environ.get("BAR_MINT_CHUNK", "40"))
+    for i in range(0, len(all_mints), CH):
+        sel = all_mints[i:i + CH]
+        bars_raw += sb_all("/trending_bars?select=mint,ts,o,h,l,c"
+                           "&mint=in.(" + ",".join(sel) + ")&order=mint.asc,ts.asc")
     bars = defaultdict(list)
     for b in bars_raw:
         bars[b["mint"]].append((b["ts"], b["o"], b["h"], b["l"], b["c"]))

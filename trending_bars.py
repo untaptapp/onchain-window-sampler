@@ -43,7 +43,8 @@ Env: SUPABASE_URL, SUPABASE_KEY. MAX_CALLS (default 900), SLEEP (default 2.1 -> 
      PRE_MIN (default 360 = 6h before first sighting), POST_H (default 3 — bars are the largest
      storage cost in the project and the exit study never reads past ~2h),
      RUN_SECONDS (default 0 = single pass),
-     MIN_OBS (default 3) — a mint seen once has no path to model, so it is skipped.
+     MIN_OBS (default 1) — collect every board sighting; see the note at its definition for why
+     a higher value is an outcome-correlated filter, not a budget saving.
 """
 import json, os, time, urllib.request, urllib.error
 from collections import defaultdict
@@ -75,7 +76,19 @@ DEFICIT_CAP_H = float(os.environ.get("DEFICIT_CAP_H", "6"))
 # Which snapshot sources are Solana. See the allowlist note in main().
 SOL_SOURCES = os.environ.get("SOL_SOURCES", "gmgn,solanatracker,geckoterminal,fomoscan")
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))
-MIN_OBS = int(os.environ.get("MIN_OBS", "3"))
+# MIN_OBS = 1: collect EVERY board sighting. This was 3 as a call-budget measure ("a mint seen
+# once has no path to model"), and that was wrong twice over. A mint seen once has exactly the same
+# price path as any other; what it has less of is BOARD data, and the only board row the analysis
+# reads is the one at t0. Worse, "seen 3+ times" is "stayed on the trending board for ~45+ minutes"
+# — information from AFTER the entry, and strongly correlated with the outcome it is used to
+# select on: mean capped_net runs -18.3% at 3 sightings to +7.9% at 26+ (rho=+0.22), runner_net
+# -29.2% to +22.4% (rho=+0.30). So a budget knob was silently choosing a winning sub-population,
+# and its strength moved with our own polling reliability (37% of Track-A-qualifying mints reached
+# nobs>=3 pre-freeze, only 13% post-freeze, because of an 11.4h polling hole). Batch resolution
+# (resolve_pools_batch, 30 mints per call) removes the budget argument that justified it.
+# Any subsetting that IS forced by budget must use a rule that cannot see the future — the queue
+# order below is by seconds-of-missing-window and sighting recency, never by board persistence.
+MIN_OBS = int(os.environ.get("MIN_OBS", "1"))
 # Share of the call budget spent on CONTROL mints drawn from candidate_universe. Without this,
 # minute bars exist only for tokens that reached a board, and the prediction study breaks two ways:
 # (1) cases would have richer features than controls, so a model could trivially learn "has bars"
@@ -183,6 +196,58 @@ def resolve_pool(mint):
     return {"mint": mint, "ok": True, "resolved_at": int(time.time()),
             "pool_address": a.get("address"), "dex": dex.get("id"),
             "reserve_usd": float(a.get("reserve_in_usd") or 0), "n_pools": len(j["data"])}
+
+
+def resolve_pools_batch(mints):
+    """Resolve up to 30 mints in ONE GeckoTerminal call.
+
+    `/tokens/{mint}/pools` costs one call PER MINT, and pool resolution is the gate on everything
+    downstream: no pool -> no bars -> never scored. That per-mint cost is what forced MIN_OBS=3,
+    and MIN_OBS=3 is an outcome-correlated filter (see D-COND) because "seen 3+ times" means "stayed
+    on the board ~45+ minutes", which predicts the return. `/tokens/multi/` takes 30 addresses and
+    `include=top_pools` returns each token's deepest pool inline, so resolution gets ~30x cheaper
+    and the budget argument for MIN_OBS disappears.
+
+    Returns {mint: record}. Mints GeckoTerminal does not know are recorded ok=False so the attempt
+    is never re-paid."""
+    now_i = int(time.time())
+    def miss(m):
+        return {"mint": m, "ok": False, "resolved_at": now_i, "pool_address": None,
+                "dex": None, "reserve_usd": None, "n_pools": 0, "last_fetch_to": None}
+    j = gt(f"{GT}/tokens/multi/{','.join(mints)}?include=top_pools")
+    if not j:
+        return {}                                   # budget exhausted or API down — retry next pass
+    by_id = {}
+    for o in (j.get("included") or []):
+        if o.get("type") != "pool":
+            continue
+        a = o.get("attributes") or {}
+        by_id[o["id"]] = (a.get("address"),
+                          float(a.get("reserve_in_usd") or 0),
+                          ((o.get("relationships") or {}).get("dex") or {}).get("data", {}).get("id"))
+    out = {}
+    # GT echoes the address it was given, but index case-insensitively too so a future EVM chain
+    # (which GT DOES lowercase) cannot silently drop every resolution on the floor.
+    want = {m.lower(): m for m in mints}
+    for t in (j.get("data") or []):
+        a = t.get("attributes") or {}
+        got = a.get("address") or ""
+        m = want.get(got.lower())
+        if not m:
+            continue
+        ids = [x["id"] for x in ((t.get("relationships") or {}).get("top_pools") or {}).get("data", [])]
+        cand = [by_id[i] for i in ids if i in by_id]
+        if not cand:
+            out[m] = miss(m); continue
+        addr, res, dex = max(cand, key=lambda c: c[1])
+        out[m] = {"mint": m, "ok": bool(addr), "resolved_at": now_i, "pool_address": addr,
+                  "dex": dex, "reserve_usd": res,
+                  # NOTE: this endpoint returns only the token's TOP pools, so n_pools is a count of
+                  # those, not of every pool as the per-mint endpoint gave. Nothing reads it.
+                  "n_pools": len(cand), "last_fetch_to": None}
+    for m in mints:
+        out.setdefault(m, miss(m))
+    return out
 
 
 def fetch_bars(pool, need_from, need_to):
@@ -410,7 +475,15 @@ def main():
         def staleness(m):
             return max(have[m][1] or 0, (pools.get(m) or {}).get("last_fetch_to") or 0)
 
-        todo = sorted(first.items(), key=lambda kv: (-deficit(kv[0], kv[1]), staleness(kv[0])))
+        # Ties (everything at the deficit cap) break on oldest-data-first, then NEWEST SIGHTING
+        # first. That last term used to be implicit — Python's stable sort left tied mints in
+        # `first`'s insertion order, which is captured_at ASCENDING, i.e. oldest first. With a
+        # never-touched pile of ~5,000 mints (which is what MIN_OBS=1 creates), that silently put
+        # every brand-new sighting behind the entire historical backlog. The backlog is
+        # backfillable from GeckoTerminal at any time; a fresh sighting is what the forward test
+        # is made of, so it goes first and the backlog drains with whatever budget is left.
+        todo = sorted(first.items(),
+                      key=lambda kv: (-deficit(kv[0], kv[1]), staleness(kv[0]), -kv[1]))
         ctrl_todo = list(controls.items())
         # INTERLEAVE, don't append. Concatenating controls after every case made them structurally
         # unreachable: with hundreds of cases queued ahead of them, no finite call budget ever
@@ -432,6 +505,32 @@ def main():
         todo = merged
         print(f"  control arm: {len(controls)} eligible universe mints, {len(ctrl_todo)} interleaved "
               f"at {UNIVERSE_FRAC:.0%} of the budget", flush=True)
+
+        # PRE-RESOLVE POOLS IN BATCHES OF 30, before the per-mint loop.
+        #
+        # This is what makes MIN_OBS=1 affordable. Resolution used to cost one GT call per mint, so
+        # covering every board sighting was ~1,900 calls/day on resolution alone and the budget said
+        # no — which is how a call-budget setting (MIN_OBS=3) ended up acting as an
+        # outcome-correlated sample filter. /tokens/multi/ takes 30 at a time, so the same coverage
+        # costs ~64 calls/day and the filter is no longer needed.
+        unres = [m for m, _ in todo if m not in pools]
+        if unres:
+            cap = int(os.environ.get("RESOLVE_CALLS", "120")) * 30
+            queued, got_ok = [], 0
+            for i in range(0, min(len(unres), cap), 30):
+                if calls["n"] >= MAX_CALLS or (t_end and time.time() >= t_end):
+                    break
+                recs = resolve_pools_batch(unres[i:i + 30])
+                for m, rec in recs.items():
+                    pools[m] = rec
+                    queued.append(rec)
+                    got_ok += 1 if rec["ok"] else 0
+            # Write them NOW rather than carrying them to the first bar flush: an interrupted run
+            # otherwise loses every resolution it just paid for.
+            flush_pools(queued, [])
+            print(f"  batch-resolved {len(queued)} pools ({got_ok} ok) in "
+                  f"{(len(queued) + 29) // 30} calls; {len(unres) - len(queued)} still unresolved",
+                  flush=True)
         print(f"universe {len(first)} mints · {len(pools)} pools cached · "
               f"{sum(1 for m in first if have[m][2])} with bars · budget {MAX_CALLS}", flush=True)
         # Attempt records are kept in their OWN batch. PostgREST rejects a bulk upsert whose objects

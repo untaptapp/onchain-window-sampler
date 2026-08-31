@@ -85,7 +85,7 @@ def main():
              "horizon_h": B.HORIZON_H, "liq_entry": e.get("liq")}
         r.update(shape(e["bars"], solat, e["t0"]))
         for nm, rule in (("capped", G.CAPPED), ("runner", G.RUNNER)):
-            g, xts, closed = B.simulate(e["bars"], rule)
+            g, xts, closed = B.simulate(e["bars"], rule, e.get("fetched_to"))
             r[f"{nm}_closed"] = bool(closed)
             if g is None:
                 r[f"{nm}_net"], r[f"{nm}_exit_ts"] = None, None

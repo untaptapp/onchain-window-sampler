@@ -91,7 +91,7 @@ def route_at(rs, ts, stats=None):
 
 def pit_net_return(e, rule, solat, routes, stats):
     """net return with PER-LEG, POINT-IN-TIME venue fees. Returns (net, entry_kind, exit_kind)."""
-    g, xts, closed = B.simulate(e["bars"], rule)
+    g, xts, closed = B.simulate(e["bars"], rule, e.get("fetched_to"))
     if g is None or not closed:
         if g is not None: stats["open_position"] += 1
         return None, None, None

@@ -149,7 +149,7 @@ def set_horizon_mark(bars_by_mint):
     return _HW
 
 
-def simulate(bars, rule):
+def simulate(bars, rule, fetched_to=None):
     """bars: [(ts,o,h,l,c)] from entry. Returns (gross_return, exit_ts, closed).
     Within a bar the LOW is assumed hit before the HIGH — stops fill before targets.
     `closed` is False when the horizon has not elapsed in the data yet: an OPEN position, which
@@ -211,7 +211,12 @@ def simulate(bars, rule):
     # The rule never fired. Two very different reasons, and conflating them was the defect:
     #   - the token stopped trading before the horizon  -> a real exit at the last traded price
     #   - the horizon simply has not elapsed yet        -> an OPEN position; not a closed trade
-    closed = _HW is None or horizon_ts <= _HW
+    # PER-MINT mark, falling back to the global one. `_HW` is the newest bar ANYWHERE, so it says
+    # "the collectors have got this far" — but a mint whose own window was never fetched past hour 1
+    # would still be scored as "stopped trading at hour 1", which is the censoring bug relocated.
+    # `fetched_to` is trending_pools.last_fetch_to: how far we actually ASKED for THIS mint.
+    mark = fetched_to or _HW
+    closed = mark is None or horizon_ts <= mark
     return r, last[0], closed
 
 
@@ -289,7 +294,11 @@ def load_entries(solat):
     ana = set()
     for _s in ANALYSIS_SOURCES:
         ana |= {r["mint"] for r in sb_all(f"/trending_snapshots?source=eq.{_s}&select=mint")}
-    ok_mints = {r["mint"] for r in sb_all("/trending_pools?select=mint&ok=is.true")}
+    prows = sb_all("/trending_pools?select=mint,last_fetch_to&ok=is.true")
+    ok_mints = {r["mint"] for r in prows}
+    # How far the collector actually ASKED for each mint. Used as the per-mint horizon mark, so
+    # "the token stopped trading" is never confused with "we never requested that window".
+    fetched_to = {r["mint"]: r["last_fetch_to"] for r in prows if r.get("last_fetch_to")}
     all_mints = sorted(ok_mints & ana)
     print(f"bar read scoped to {len(all_mints):,} mints "
           f"({len(ok_mints):,} ok pools, {len(ok_mints - ana):,} control-arm skipped)", flush=True)
@@ -324,7 +333,17 @@ def load_entries(solat):
                 continue
             t0 = r["captured_at"] / 1000
             seg = [b for b in bb if b[0] >= t0 - 60]
-            if len(seg) < 20:            # need a real path, not a stub
+            # `len(seg) < 20` used to sit here. It is replaced on principle, not on measurement:
+            # a token that stops trading is a REAL exit at the last traded price (simulate() has
+            # handled that since the censoring fix), so an arbitrary bar COUNT is not the right
+            # test — the right test is whether we asked for the whole window, which `fetched_to`
+            # now answers per mint. MEASURED, the old filter removed 59 of 1,248 paths (4.7%), and
+            # they were slightly BETTER than the ones it kept (mean -10.7% vs -17.2%, medians
+            # -25.7% vs -26.2%) — so it was not the survivorship trap it looked like, and dropping
+            # it moves the aggregate very little. The real conditioning problem was upstream, in
+            # MIN_OBS.
+            if len(seg) < 2:
+                dropped["no_path"] += 1
                 continue
             if (seg[0][0] - t0) / 60 > ENTRY_TOL_MIN:
                 dropped["stale_entry_bar"] += 1      # no bar near t0 => no fill was available
@@ -350,7 +369,8 @@ def load_entries(solat):
                      "bundle": None, "rug": None, "smart": None, "renown": None, "top10": None}
             ls = sorted(liqser[m])
             ents.append({"src": src, "mint": m, "t0": t0, "bars": seg, "rank": r.get("rank"),
-                         "mcap": r.get("market_cap"), "liq": r.get("liquidity"), "liqser": ls, **f})
+                         "mcap": r.get("market_cap"), "liq": r.get("liquidity"), "liqser": ls,
+                         "fetched_to": fetched_to.get(m), **f})
     if dropped:
         tot = len(ents) + sum(dropped.values())
         print(f"dropped {sum(dropped.values())}/{tot} entries "
@@ -387,7 +407,7 @@ def liq_at(ls, ts, stats=None):
 
 
 def gross_return(e, rule, solat):
-    g, xts, closed = simulate(e["bars"], rule)
+    g, xts, closed = simulate(e["bars"], rule, e.get("fetched_to"))
     if g is None or not closed:
         if g is not None: _S["open_position"] += 1
         return None
@@ -396,7 +416,7 @@ def gross_return(e, rule, solat):
 
 
 def net_return(e, rule, solat):
-    g, xts, closed = simulate(e["bars"], rule)
+    g, xts, closed = simulate(e["bars"], rule, e.get("fetched_to"))
     if g is None:
         return None
     if not closed:

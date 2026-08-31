@@ -11,8 +11,22 @@ on:
   workflow_dispatch: {}
 
 concurrency:
+  # cancel-in-progress: TRUE on the board pollers, deliberately.
+  #
+  # These feeds cannot be backfilled, and `false` kept losing them. A run holds the group for its
+  # whole RUN_SECONDS; GitHub keeps at most one pending run per group and drops the others, and
+  # when the run finally ends the scheduler does not reliably start a fresh one -- measured
+  # 2026-08-31: trending-gmgn-rh ended 21:20 and had produced NO new run by 22:53 (three cron slots
+  # missed, 93 minutes of board data gone); trending-st the same, 76 minutes. Reducing cron
+  # frequency was tried first on a scheduler-pressure hypothesis and did NOT fix it.
+  #
+  # With `true`, every cron slot starts a fresh run and kills the old one, so a restart cannot be
+  # dropped by pending-run bookkeeping. The poll cadence is unchanged: each job polls immediately at
+  # startup and then every PASS_INTERVAL, so a 30-minute lifetime still yields the same 15/5-minute
+  # cadence. The cost is ~45s of runner setup per restart, which is the right price for a feed that
+  # is gone forever if missed.
   group: trending-gt
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   run:

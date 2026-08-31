@@ -231,7 +231,13 @@ def main():
         # every bar row client-side is O(all bars) on EVERY pass — it already timed out at 122k
         # rows and would only get worse as the table grows.
         have = defaultdict(lambda: [None, None, 0])
-        for r in sb_all("/trending_bar_coverage?select=mint,ts_from,ts_to,n_bars"):
+        # Coverage comes from the maintained TABLE, not the trending_bar_coverage VIEW.
+        # The view is `group by mint` over the whole bars table: at 900k rows it took ~82 seconds
+        # regardless of how few mints were requested (the aggregate runs before the filter), which
+        # is above Cloudflare's ~100s gateway limit — so this one call, made once per pass, is what
+        # stopped the collector from running at all. The table is ~4.6k rows and reads in ~1s.
+        # It is kept current below: every mint this pass writes bars for gets its row updated.
+        for r in sb_all("/trending_bar_cov?select=mint,ts_from,ts_to,n_bars"):
             have[r["mint"]] = [r["ts_from"], r["ts_to"], r["n_bars"]]
         now = time.time()
         # CONTROL arm: sample mints seen in the candidate universe that never reached a board.
@@ -346,6 +352,13 @@ def main():
         # whichever is further from complete goes first.
         # Ties (everything at the cap) break on OLDEST-DATA-FIRST, which is a fair round-robin:
         # whoever has gone longest without a successful fetch or an attempt goes next.
+        def flush_cov(rows):
+            for i in range(0, len(rows), 500):
+                st, _ = sb("POST", "/trending_bar_cov?on_conflict=mint", rows[i:i + 500],
+                           prefer="resolution=merge-duplicates,return=minimal")
+                if st >= 300:
+                    print(f"!! trending_bar_cov write FAILED {st}", flush=True)
+
         def flush_pools(rows, attempts):
             """Two uniform batches, never one mixed one — and CHECK the status, because this write
             failing silently is what hid the bug."""
@@ -389,7 +402,7 @@ def main():
         # resolve_pool record with a two-key attempt record 400s the ENTIRE batch. That failure was
         # silent (the pools write ignores its status), and it took the newly resolved pools down with
         # it, so every resolution was lost and re-paid for on the next pass.
-        new_pools, new_attempts, new_bars, done = [], [], [], 0
+        new_pools, new_attempts, new_bars, new_cov, done = [], [], [], [], 0
         for mint, t0 in todo:
             if calls["n"] >= MAX_CALLS:
                 break
@@ -418,6 +431,16 @@ def main():
             if cov[0] is not None and cov[0] <= need_from + 180 and cov[1] >= need_to - 180:
                 continue
             bars = fetch_bars(p["pool_address"], need_from, need_to)
+            if bars:
+                # Keep trending_bar_cov current for this mint, merging with what we already had so
+                # a partial re-fetch never narrows the recorded window.
+                lo_new = min(int(b[0]) for b in bars); hi_new = max(int(b[0]) for b in bars)
+                cov0, cov1, covn = have[mint]
+                have[mint] = [min(lo_new, cov0) if cov0 is not None else lo_new,
+                              max(hi_new, cov1) if cov1 is not None else hi_new,
+                              (covn or 0) + len(bars)]
+                new_cov.append({"mint": mint, "ts_from": have[mint][0], "ts_to": have[mint][1],
+                                "n_bars": have[mint][2]})
             # Remember how far we asked, so a dead token's deficit collapses after ONE attempt
             # instead of re-queuing at the head of the list on every pass.
             # A pool resolved THIS iteration is already in new_pools by reference, so mutating it
@@ -436,11 +459,11 @@ def main():
                        prefer="resolution=merge-duplicates,return=minimal")
                 # flush pools on the SAME cadence — writing them only at end-of-pass meant an
                 # interrupted run lost every resolution and re-paid for it on the next pass
-                flush_pools(new_pools, new_attempts)
+                flush_pools(new_pools, new_attempts); flush_cov(new_cov)
                 print(f"  .. {done} mints, {len(new_bars)} bars + {len(new_pools)} pools flushed, "
                       f"{calls['n']} calls", flush=True)
-                new_bars, new_pools, new_attempts = [], [], []
-        flush_pools(new_pools, new_attempts)
+                new_bars, new_pools, new_attempts, new_cov = [], [], [], []
+        flush_pools(new_pools, new_attempts); flush_cov(new_cov)
         for i in range(0, len(new_bars), 500):
             sb("POST", "/trending_bars?on_conflict=mint,ts", new_bars[i:i + 500],
                prefer="resolution=merge-duplicates,return=minimal")

@@ -268,6 +268,9 @@ def ff(v):
     except (TypeError, ValueError): return None
 
 
+ANALYSIS_SOURCES = ("gmgn", "solanatracker", "geckoterminal")
+
+
 def load_entries(solat):
     """One entry per (source, mint): board features at first sighting + minute bars after it."""
     # Read bars in CHUNKS OF MINTS, never by deep offset.
@@ -277,8 +280,19 @@ def load_entries(solat):
     # whole analysis with it. Filtering by a batch of mints turns each request into an index range
     # scan on the (mint, ts) primary key — bounded work per request, independent of table size, and
     # it never pages past what it asks for.
-    mint_rows = sb_all("/trending_pools?select=mint&ok=is.true&order=mint.asc")
-    all_mints = [r["mint"] for r in mint_rows]
+    # Only mints that can BECOME an entry. trending_pools is shared with the control arm — the
+    # collector resolves pools for pump.fun launches that never reached a board — so 1,888 of its
+    # 3,540 ok mints (53%) had their bars read and then discarded by the `bars.get(m)` lookup below
+    # on every single run. Intersecting with the analysis sources first halves the read, which is
+    # what pushed materialize-paths past its 60-minute timeout and left the forward-test sample
+    # stale for a day. Purely a cost change: a mint outside this set was never used.
+    ana = set()
+    for _s in ANALYSIS_SOURCES:
+        ana |= {r["mint"] for r in sb_all(f"/trending_snapshots?source=eq.{_s}&select=mint")}
+    ok_mints = {r["mint"] for r in sb_all("/trending_pools?select=mint&ok=is.true")}
+    all_mints = sorted(ok_mints & ana)
+    print(f"bar read scoped to {len(all_mints):,} mints "
+          f"({len(ok_mints):,} ok pools, {len(ok_mints - ana):,} control-arm skipped)", flush=True)
     bars_raw, CH = [], int(os.environ.get("BAR_MINT_CHUNK", "40"))
     for i in range(0, len(all_mints), CH):
         sel = all_mints[i:i + CH]
@@ -295,7 +309,7 @@ def load_entries(solat):
           flush=True)
     ents = []
     dropped = defaultdict(int)
-    for src in ("gmgn", "solanatracker", "geckoterminal"):
+    for src in ANALYSIS_SOURCES:
         rows = sb_all(f"/trending_snapshots?source=eq.{src}"
                       "&select=mint,captured_at,rank,price,market_cap,liquidity,extra&order=captured_at.asc")
         seen = {}

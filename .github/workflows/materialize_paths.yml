@@ -23,14 +23,16 @@ on:
         default: '0'
 
 concurrency:
-  # SHARED with trending-bars -- see the note there. These two must not overlap.
-  group: heavy-db
+  # Its OWN group. A group shared with trending-bars starved this job completely -- see the note
+  # there. This one must keep its hourly slot: it is the only thing that turns bars into scored
+  # trades, so every hour it misses is an hour the pre-registered forward test does not advance.
+  group: materialize-paths
   cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

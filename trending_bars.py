@@ -360,15 +360,35 @@ def main():
                     print(f"!! trending_bar_cov write FAILED {st}", flush=True)
 
         def flush_pools(rows, attempts):
-            """Two uniform batches, never one mixed one — and CHECK the status, because this write
-            failing silently is what hid the bug."""
+            """Write pools in batches that are uniform BY CONSTRUCTION, not by convention.
+
+            Splitting resolutions from attempts is not enough. A pool resolved this iteration is
+            held by reference in `rows`, and the fetch loop later mutates it with `last_fetch_to`
+            — but only when the pool is ok and a fetch was attempted. A not-ok pool never reaches
+            that line, so `rows` ends up holding 7-key and 8-key objects, PostgREST rejects the
+            whole batch with PGRST102 "All object keys must match", and every resolution in it is
+            silently discarded. Measured on run 33369090482: three 400s, 511 lost resolutions in
+            one pass. Those mints then have no pool, so they get no bars, so they are never scored
+            — which is why post-freeze coverage sat at 8% of board-qualifying mints while the
+            board itself was perfectly healthy.
+
+            Grouping by key-set makes the shape irrelevant: whatever mix arrives, each shape goes
+            out in its own request."""
+            from collections import defaultdict as _dd
             for batch, path in ((rows, "resolutions"), (attempts, "attempts")):
-                for i in range(0, len(batch), 500):
-                    st, _ = sb("POST", "/trending_pools?on_conflict=mint", batch[i:i + 500],
-                               prefer="resolution=merge-duplicates,return=minimal")
-                    if st >= 300:
-                        print(f"!! trending_pools {path} write FAILED {st} "
-                              f"({len(batch[i:i+500])} rows)", flush=True)
+                shapes = _dd(list)
+                for r in batch:
+                    shapes[tuple(sorted(r))].append(r)
+                if len(shapes) > 1:
+                    print(f"   note: {path} batch had {len(shapes)} key-shapes, "
+                          f"sent separately", flush=True)
+                for grp in shapes.values():
+                    for i in range(0, len(grp), 500):
+                        st, body = sb("POST", "/trending_pools?on_conflict=mint", grp[i:i + 500],
+                                      prefer="resolution=merge-duplicates,return=minimal")
+                        if st >= 300:
+                            print(f"!! trending_pools {path} write FAILED {st} "
+                                  f"({len(grp[i:i+500])} rows): {body}", flush=True)
 
         def staleness(m):
             return max(have[m][1] or 0, (pools.get(m) or {}).get("last_fetch_to") or 0)
@@ -419,6 +439,10 @@ def main():
             newly = False
             if p is None:
                 p = resolve_pool(mint)
+                # Give every fresh resolution the same key set the fetch loop may later add, so the
+                # batch stays uniform whether or not this mint reaches the fetch. Safe to write NULL
+                # here precisely because this mint had no row: it cannot clobber an existing mark.
+                p.setdefault("last_fetch_to", None)
                 new_pools.append(p)
                 pools[mint] = p
                 newly = True

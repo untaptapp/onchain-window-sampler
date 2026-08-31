@@ -12,11 +12,13 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  # SHARED with materialize-paths. Both read the bars table end to end, and on this
-  # instance (1 GB RAM, 224 MB shared_buffers) running them together starves both: a
-  # materialize run sat at 94 minutes while the collector ran, and ordinary queries from
-  # anywhere else timed out. Sharing the group serialises them.
-  group: heavy-db
+  # NOT shared with materialize-paths. Sharing a group was tried and made things worse: this job
+  # runs for RUN_SECONDS=18000 (5h) and its own cron re-queues it hourly, so it holds the group
+  # continuously. GitHub keeps at most ONE pending run per group and DROPS the rest, so
+  # materialize-paths went from failing sometimes to not running at all — zero runs in 5.1 hours,
+  # nothing queued, nothing cancelled, no error anywhere. The contention it was meant to fix is
+  # addressed at the source instead: load_entries no longer reads control-arm bars (a 2.1x cut).
+  group: trending-bars
   cancel-in-progress: false
 
 jobs:

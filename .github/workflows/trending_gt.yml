@@ -7,7 +7,7 @@ name: trending-gt
 # fomoscan board. Writes trending_snapshots with source='geckoterminal'.
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch: {}
 
 concurrency:

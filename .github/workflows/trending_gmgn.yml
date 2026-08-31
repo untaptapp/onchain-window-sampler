@@ -7,7 +7,7 @@ name: trending-gmgn
 # Writes trending_snapshots with source='gmgn'. Needs the GMGN_KEY secret (read-only key).
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch: {}
 
 concurrency:

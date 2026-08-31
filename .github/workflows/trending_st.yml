@@ -7,7 +7,7 @@ name: trending-st
 # with source='solanatracker'. Needs the SOLANA_TRACKER_KEY secret.
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch: {}
 
 concurrency:

@@ -159,7 +159,7 @@ def one_pass():
 
 def main():
     end = time.time() + RUN_SECONDS
-    n = 0; fails = 0
+    n = 0; fails = 0; bad = None
     while True:
         try:
             outcome, _g = one_pass(); n += 1
@@ -167,15 +167,22 @@ def main():
             print("pass error:", repr(ex), flush=True); outcome = "fail"
         if outcome == "quota":
             print("RATE LIMIT — exiting so the run status reflects it (cron re-checks).", flush=True)
-            break
+            bad = "rate limit"; break
         fails = fails + 1 if outcome == "fail" else 0
         if fails >= 6:
             print(f"{fails} consecutive failures — exiting to avoid a silent zombie run.", flush=True)
-            break
+            bad = f"{fails} consecutive failures"; break
         if time.time() >= end:
             break
         time.sleep(PASS_INTERVAL)
     print(f"done {n} passes", flush=True)
+    # An early break must FAIL the run. Both breaks above used to exit 0, so a poller that gave up
+    # after 2h of a 5.5h budget was indistinguishable from one that ran to completion — and the
+    # board is the one feed that cannot be backfilled. On 2026-08-31 that exact exit left an 11.4h
+    # hole (02:18-06:23 and 06:23-13:39) that nothing in the workflow list flagged.
+    if bad:
+        raise SystemExit(f"collector exited early: {bad} — {n} passes, "
+                         f"{(time.time() - (end - RUN_SECONDS)) / 3600:.1f}h of {RUN_SECONDS/3600:.1f}h budget")
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ name: trending-gmgn-rh
 # covers comfortably.
 on:
   schedule:
-    - cron: '7,22,37,52 * * * *'   # offset from the Solana poller so the two never burst together
+    - cron: '12,42 * * * *'   # offset from the Solana poller so the two never burst together
   workflow_dispatch: {}
 
 concurrency:

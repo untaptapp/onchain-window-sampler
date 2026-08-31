@@ -23,7 +23,8 @@ on:
         default: '0'
 
 concurrency:
-  group: materialize-paths
+  # SHARED with trending-bars -- see the note there. These two must not overlap.
+  group: heavy-db
   cancel-in-progress: false
 
 jobs:

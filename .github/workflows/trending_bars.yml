@@ -12,7 +12,11 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: trending-bars
+  # SHARED with materialize-paths. Both read the bars table end to end, and on this
+  # instance (1 GB RAM, 224 MB shared_buffers) running them together starves both: a
+  # materialize run sat at 94 minutes while the collector ran, and ordinary queries from
+  # anywhere else timed out. Sharing the group serialises them.
+  group: heavy-db
   cancel-in-progress: false
 
 jobs:

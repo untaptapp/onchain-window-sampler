@@ -113,19 +113,30 @@ def sb_all(path, page=1000, cap=600000):
         h = {"apikey": KEY, "Authorization": f"Bearer {KEY}",
              "Range-Unit": "items", "Range": f"{len(out)}-{len(out) + page - 1}"}
         chunk = None
-        for a in range(4):
+        TRIES = 5
+        for a in range(TRIES):
             try:
                 with urllib.request.urlopen(urllib.request.Request(SB + path, headers=h), timeout=90) as r:
                     t = r.read(); chunk = json.loads(t) if t else []
                 break
             except urllib.error.HTTPError as e:
-                if e.code == 416:
+                if e.code == 416:                      # range past the end — a real empty answer
                     chunk = []; break
-                if e.code in (429, 500, 502, 503):
-                    time.sleep(1.5 * (a + 1)); continue
-                chunk = []; break
-            except Exception:
+                # FAIL LOUD. This used to set `chunk = []` and break, so a failed page returned a
+                # SHORT list that read as a complete one. That is the 1000-row silent-truncation
+                # trap wearing a different hat, and it cost a whole collection day: the snapshots
+                # query 500'd on its first page under the old 8s statement timeout, `first` came
+                # back empty, and the run printed "universe 0 mints" and spent six hours fetching
+                # control-arm bars while the case arm — the forward test itself — got nothing.
+                if e.code < 500 or a == TRIES - 1:
+                    raise
                 time.sleep(1.5 * (a + 1))
+            except Exception:
+                if a == TRIES - 1:
+                    raise
+                time.sleep(1.5 * (a + 1))
+        if chunk is None:
+            raise RuntimeError(f"sb_all: page at offset {len(out)} never returned for {path[:70]}")
         if not chunk:
             break
         out += chunk
@@ -218,6 +229,12 @@ def main():
                 last[m] = t
         # a mint seen once has no path to model — never spend GT calls on it
         first = {m: t for m, t in first.items() if nobs[m] >= MIN_OBS}
+        # An empty case arm is never legitimate — there are thousands of Solana board sightings on
+        # record — so it can only mean the snapshot read came back short. Refuse to spend the call
+        # budget on the control arm alone, which is what a silent short read bought last time.
+        if not first:
+            raise RuntimeError(f"case arm EMPTY after MIN_OBS={MIN_OBS} on {len(snaps)} snapshot "
+                               f"rows — refusing to run the control arm on its own")
         # Which mints get the long post window. Read from the trending_mint_age VIEW, which is the
         # single definition shared with prune_trending_bars — if the collector and the retention job
         # disagreed, one would fetch bars the other immediately deletes, burning GT calls forever.

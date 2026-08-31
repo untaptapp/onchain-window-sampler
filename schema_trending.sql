@@ -33,7 +33,9 @@ create table if not exists trending_snapshots (
 -- feature block. Zero collisions had occurred when this was found — which is exactly when to fix it.
 create unique index if not exists trending_snap_uniq_src on trending_snapshots(mint, captured_at, source);
 -- per-token trajectory (rank/volume velocity, first-seen = entry event)
-create index if not exists trending_snap_mint_idx on trending_snapshots(mint, captured_at);
+-- NO (mint, captured_at) index: trending_snap_uniq_src is a unique btree on
+-- (mint, captured_at, source), and a btree serves any query its LEADING columns cover — so the
+-- narrower index was redundant. Dropped 2026-08-31 (9.6 MB + a write per snapshot).
 -- whole-board scans by time
 create index if not exists trending_snap_time_idx on trending_snapshots(captured_at);
 

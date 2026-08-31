@@ -32,7 +32,10 @@ create table if not exists trending_bars (
   vol    double precision,
   primary key (mint, ts)
 );
-create index if not exists trending_bars_mint_ts_idx on trending_bars(mint, ts);
+-- NO separate (mint, ts) index. The PRIMARY KEY (mint, ts) already creates a unique btree on
+-- exactly those columns, so a second index on them is pure cost: it was 119 MB (32% of this
+-- table's total size), it duplicated every insert into the project's hottest write path, and it
+-- competed with the PK for a 224 MB shared_buffers. It was dropped 2026-08-31. Do not re-add it.
 
 alter table trending_pools enable row level security;
 alter table trending_bars  enable row level security;

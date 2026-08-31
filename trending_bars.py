@@ -393,6 +393,15 @@ def main():
         for mint, t0 in todo:
             if calls["n"] >= MAX_CALLS:
                 break
+            # The RUN_SECONDS budget must be honoured HERE, not only between passes. A pass is
+            # thousands of rate-limited calls and now runs far longer than it used to, so checking
+            # only at pass end overshot the workflow's `timeout-minutes: 340` every single time:
+            # six consecutive runs were killed at exactly 340 minutes mid-pass. GitHub records a
+            # timeout as "cancelled", not "failure", so the workflow list looked healthy while the
+            # collector was being killed on every run and the final flush and prune never ran.
+            if t_end and time.time() >= t_end:
+                print(f"  run budget reached ({RUN_SECONDS}s) — stopping cleanly mid-pass", flush=True)
+                break
             p = pools.get(mint)
             newly = False
             if p is None:

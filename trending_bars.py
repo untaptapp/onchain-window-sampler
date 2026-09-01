@@ -98,6 +98,11 @@ UNIVERSE_FRAC = float(os.environ.get("UNIVERSE_FRAC", "0.4"))
 
 # Retention is GLOBAL and must run from exactly one collector instance — see the call site.
 PRUNE = os.environ.get("PRUNE", "1") not in ("0", "false", "")
+
+# Skip the batch-resolve phase while this many already-resolved mints still have no bars. Resolution
+# is 30 mints/call and fetching is 1 mint/call, so without this the resolved pile grows every pass
+# and the front-loaded resolve phase steals budget and wall time from the fetch loop.
+RESOLVE_SKIP_ABOVE = int(os.environ.get("RESOLVE_SKIP_ABOVE", "1500"))
 # The GeckoTerminal network. Robinhood Chain (id 4663) is served under `robinhood` — verified live
 # 2026-09-01: /networks/robinhood/tokens/multi/ returned 30/30 board mints with pools
 # (uniswap-v4-robinhood, pons-v2-dex, bankr-robinhood), and /pools/<addr>/ohlcv/minute returned
@@ -546,8 +551,26 @@ def main():
         # outcome-correlated sample filter. /tokens/multi/ takes 30 at a time, so the same coverage
         # costs ~64 calls/day and the filter is no longer needed.
         unres = [m for m, _ in todo if m not in pools]
+        # DON'T resolve ahead of what bar-fetching can consume.
+        #
+        # Resolution is ~30 mints per call; a bar fetch is 1 mint per call. So the resolve phase
+        # outruns the fetch loop 30:1 by construction, and it runs FIRST, before any bars. Measured
+        # 2026-09-01: Solana had 10,658 resolved pools against 4,840 with bars — a 5,818-mint
+        # backlog already queued — while each pass still resolved another ~3,600 and fetched ~950.
+        # Under 429 backoff (~37s/call) that is ~75 minutes of every pass with the bar table
+        # completely idle, and ~25% of the call budget spent enlarging a pile nothing can consume.
+        #
+        # A resolved pool is permanent, so this is not wasted work — it is work done far too early,
+        # at the cost of the only thing that produces scored trades. Skip resolution entirely while
+        # the fetch loop already has a deep enough queue.
+        unfetched = sum(1 for m in first
+                        if (pools.get(m) or {}).get("ok") and (have.get(m) or [None])[0] is None)
+        if unres and unfetched > RESOLVE_SKIP_ABOVE:
+            print(f"  skipping pool resolution: {unfetched} resolved mints still have no bars "
+                  f"(> {RESOLVE_SKIP_ABOVE}); {len(unres)} unresolved can wait", flush=True)
+            unres = []
         if unres:
-            cap = int(os.environ.get("RESOLVE_CALLS", "120")) * 30
+            cap = int(os.environ.get("RESOLVE_CALLS", "40")) * 30
             # Flush every FLUSH_EVERY records, NOT at the end of the loop. 120 calls is several
             # minutes of wall time, and holding every resolution until then is the same "an
             # interrupted run loses what it just paid for" failure this is supposed to avoid —

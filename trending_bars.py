@@ -589,7 +589,12 @@ def main():
         # no — which is how a call-budget setting (MIN_OBS=3) ended up acting as an
         # outcome-correlated sample filter. /tokens/multi/ takes 30 at a time, so the same coverage
         # costs ~64 calls/day and the filter is no longer needed.
-        unres = [m for m, _ in todo if m not in pools]
+        # Carry each mint's OWN t0 through. `todo` is cases interleaved with controls, and a control
+        # mint is not a key of `first` — so looking its age up there raises KeyError on the first
+        # control that needs resolving. That killed the collector outright on 2026-09-01 (both arms
+        # have thousands of unresolved mints, so the guard below is reached on every pass).
+        unres_pairs = [(m, t0) for m, t0 in todo if m not in pools]
+        unres = [m for m, _ in unres_pairs]
         # DON'T resolve ahead of what bar-fetching can consume.
         #
         # Resolution is ~30 mints per call; a bar fetch is 1 mint per call. So the resolve phase
@@ -610,7 +615,7 @@ def main():
             # Measured: with the blanket guard, pool coverage for mints first seen 3-6h ago fell
             # from 72% to 12% in 90 minutes, so the freshest cohort could never become scoreable at
             # all. Backfill can wait for the queue to drain; today's board cannot.
-            fresh = [m for m in unres if now - first[m] <= RESOLVE_ALWAYS_H * 3600]
+            fresh = [m for m, t0 in unres_pairs if now - t0 <= RESOLVE_ALWAYS_H * 3600]
             print(f"  pool resolution: {unfetched} resolved mints still have no bars "
                   f"(> {RESOLVE_SKIP_ABOVE}) — deferring {len(unres) - len(fresh)} backfill "
                   f"resolutions, still resolving {len(fresh)} fresh (<{RESOLVE_ALWAYS_H}h) mints",

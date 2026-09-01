@@ -30,6 +30,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      # Score first, THEN collect. materialize-paths' own cron cannot be relied on: it missed both
+      # its 01:25 and 02:25 slots on 2026-09-01 with a free concurrency group and 11 of a 20-job
+      # limit in use, and after moving to */20 it still missed ~9 consecutive slots (08:25 -> 11:37).
+      # Other workflows' scheduled runs fired normally throughout, and every workflow reports
+      # state=active, so this is not disablement and I could not determine the cause. Rather than
+      # tune the cron a third time, scoring is anchored to a job that demonstrably does restart.
+      # ~6 minutes against a 5-hour collection run, and it runs BEFORE the collector so the bars the
+      # previous run finished are scored immediately. The cron stays as a second chance.
+      - name: materialize (scoring — do not depend on materialize-paths' cron alone)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          KEEP_DAYS: '0'
+        run: python materialize_paths.py
       - name: run
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

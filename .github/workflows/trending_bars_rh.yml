@@ -15,7 +15,14 @@ name: trending-bars-rh
 # before_timestamp paging.
 on:
   schedule:
-    - cron: '10 * * * *'      # offset from trending-bars (:40) so the two never start together
+    # THREE slots, not one. A single hourly slot means one dropped scheduled event is a full
+    # hour idle -- measured 2026-09-01, the 19:10 and 20:10 slots were both dropped after a cancel and
+    # Robinhood bar collection sat dead for 2.5h with nothing recording it (C0f). Extra slots are
+    # free: with cancel-in-progress:false GitHub keeps at most one pending run and drops the rest,
+    # so they change nothing while a run is active and only matter when the job is idle -- which is
+    # precisely the case that failed. Offset from trending-bars (:00,:20,:40) so the two never
+    # start together.
+    - cron: '10,30,50 * * * *'
   workflow_dispatch: {}
 
 concurrency:

@@ -8,7 +8,9 @@ name: trending-bars
 # extending it forward. Resumable: least-covered mints first, budgeted per run.
 on:
   schedule:
-    - cron: '40 * * * *'
+    # Three slots so a dropped scheduled event costs 20 minutes, not an hour (C0f). Offset from
+    # trending-bars-rh (:10,:30,:50).
+    - cron: '0,20,40 * * * *'
   workflow_dispatch: {}
 
 concurrency:

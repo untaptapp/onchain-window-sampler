@@ -235,7 +235,23 @@ def build_queue():
             if (r["mint"], t) in done:
                 continue
             controls.append((r["mint"].lower(), t, "control"))
-    return cases + controls
+    # INTERLEAVE, don't append — the same defect trending_bars.py already carries a comment about.
+    # `cases + controls` puts every control behind 240 cases, so a pass that runs out of calls or
+    # wall-clock never reaches one: measured, rh_tape held 106 case rows and 0 control rows. Round
+    # robin so both arms advance in roughly CONTROL_FRAC proportion on every pass.
+    out, i, j = [], 0, 0
+    step = (1 - CONTROL_FRAC) / CONTROL_FRAC if 0 < CONTROL_FRAC < 1 else None
+    if step is None:
+        return controls if CONTROL_FRAC >= 1 else cases
+    acc = 0.0
+    while i < len(cases) or j < len(controls):
+        if i < len(cases) and (acc < step or j >= len(controls)):
+            out.append(cases[i]); i += 1; acc += 1
+        elif j < len(controls):
+            out.append(controls[j]); j += 1; acc = 0.0
+        else:
+            break
+    return out
 
 
 CREATOR, BORN = {}, {}

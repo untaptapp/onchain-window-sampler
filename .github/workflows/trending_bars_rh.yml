@@ -1,0 +1,55 @@
+name: trending-bars-rh
+
+# Minute price paths for ROBINHOOD CHAIN (id 4663), the second chain in this study.
+#
+# Same collector as trending-bars, pointed at a different GeckoTerminal network. Verified live
+# 2026-09-01: /networks/robinhood/tokens/multi/ resolved 30/30 board mints to pools
+# (uniswap-v4-robinhood, pons-v2-dex, bankr-robinhood, reserves $15k-$149k) and
+# /pools/<addr>/ohlcv/minute returned 1,000 bars current to the minute.
+#
+# This UNBLOCKS ALL OUTCOME MEASUREMENT on Robinhood. Until it runs, the only Robinhood return that
+# can be computed is a board-to-board price change, which is measurable ONLY while a token is still
+# trending -- exactly the survivorship trap that made Solana's board-only reading (+162.6% mean at
+# 3h) differ from the bar-based truth (-16% to -49%) by ~180 points. The 2,467 mints of board
+# history already collected are fully backfillable: GeckoTerminal serves complete OHLCV with
+# before_timestamp paging.
+on:
+  schedule:
+    - cron: '10 * * * *'      # offset from trending-bars (:40) so the two never start together
+  workflow_dispatch: {}
+
+concurrency:
+  # Its OWN group, not shared with trending-bars. Sharing a group with a 5h job is what starved
+  # materialize-paths to zero runs in 5.1 hours on 2026-08-31.
+  group: trending-bars-rh
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GT_NETWORK: 'robinhood'
+          SOL_SOURCES: 'gmgn_rh'
+          # No control arm on this chain: candidate_universe and pump_launches are both Solana.
+          # Risk-set controls for Robinhood need the launch firehose (eth_getLogs on the launchpad
+          # factories) -- component 4 of research/robinhood-expansion.md, not yet built.
+          UNIVERSE_FRAC: '0'
+          # Retention runs from the Solana instance only; prune_trending_bars is global and a
+          # full-table delete, so running it from both is contention for nothing.
+          PRUNE: '0'
+          MAX_CALLS: '2400'
+          RUN_SECONDS: '18000'
+          SLEEP: '2.1'
+          # POST_H / LONG_POST_H deliberately NOT set: they must equal prune_trending_bars'
+          # post_h/long_post_h defaults (6 / 24) or the collector re-fetches what the pruner
+          # deletes, forever.
+        run: python trending_bars.py

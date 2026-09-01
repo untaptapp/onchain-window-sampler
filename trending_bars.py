@@ -95,7 +95,27 @@ MIN_OBS = int(os.environ.get("MIN_OBS", "1"))
 #     = case; and (2) we could never test the second success criterion — whether a flagged token
 # that NEVER trends is still profitable — because we would have no price path for it.
 UNIVERSE_FRAC = float(os.environ.get("UNIVERSE_FRAC", "0.4"))
-GT = "https://api.geckoterminal.com/api/v2/networks/solana"
+
+# Retention is GLOBAL and must run from exactly one collector instance — see the call site.
+PRUNE = os.environ.get("PRUNE", "1") not in ("0", "false", "")
+# The GeckoTerminal network. Robinhood Chain (id 4663) is served under `robinhood` — verified live
+# 2026-09-01: /networks/robinhood/tokens/multi/ returned 30/30 board mints with pools
+# (uniswap-v4-robinhood, pons-v2-dex, bankr-robinhood), and /pools/<addr>/ohlcv/minute returned
+# 1,000 minute bars current to the minute. So one collector serves both chains; only this and
+# SOL_SOURCES change. Shared tables need no migration: base58 and 0x addresses cannot collide.
+GT_NETWORK = os.environ.get("GT_NETWORK", "solana")
+GT = f"https://api.geckoterminal.com/api/v2/networks/{GT_NETWORK}"
+
+# FAIL CLOSED on a network/source mismatch. Pointing the Solana network at gmgn_rh (or the reverse)
+# would spend the whole call budget resolving addresses that can never resolve, and cache every
+# failure as ok=false — poisoning trending_pools for the chain that WOULD have worked. An address
+# shape check is the cheapest possible guard: EVM mints start 0x, Solana mints are base58.
+EVM_NETWORKS = {"robinhood"}
+
+
+def wrong_chain(mint):
+    is_evm = mint.startswith("0x")
+    return is_evm != (GT_NETWORK in EVM_NETWORKS)
 UA = {"Accept": "application/json;version=20230302", "User-Agent": "Mozilla/5.0"}
 
 
@@ -294,6 +314,18 @@ def main():
                 last[m] = t
         # a mint seen once has no path to model — never spend GT calls on it
         first = {m: t for m, t in first.items() if nobs[m] >= MIN_OBS}
+        # Drop anything whose address shape does not match GT_NETWORK, and SHOUT if that is most of
+        # the universe — that means SOL_SOURCES and GT_NETWORK disagree and the run would be a
+        # budget bonfire.
+        bad = [m for m in first if wrong_chain(m)]
+        if bad:
+            print(f"  !! {len(bad)}/{len(first)} mints have the wrong address shape for "
+                  f"GT_NETWORK={GT_NETWORK} — dropping them", flush=True)
+            if len(bad) > len(first) * 0.5:
+                raise RuntimeError(f"GT_NETWORK={GT_NETWORK} vs SOL_SOURCES={SOL_SOURCES}: "
+                                   f"{len(bad)}/{len(first)} mints are the wrong chain — refusing")
+            for m in bad:
+                del first[m]
         # An empty case arm is never legitimate — there are thousands of Solana board sightings on
         # record — so it can only mean the snapshot read came back short. Refuse to spend the call
         # budget on the control arm alone, which is what a silent short read bought last time.
@@ -620,7 +652,15 @@ def main():
         # this the table grows by hundreds of MB/day and exhausts the 500 MB budget in under a day.
         # Runs as an RPC so the delete happens IN the database — pulling bars client-side to filter
         # them would burn the 5 GB monthly egress budget (one full read is already ~88 MB).
-        st, pruned = sb("POST", "/rpc/prune_trending_bars", {})
+        # Only ONE collector instance may prune. Both the Solana and Robinhood instances run this
+        # loop, and prune_trending_bars is a full-table delete on a 1 GB instance — running it from
+        # two jobs concurrently is pure contention for no benefit, and the pruner is global (it
+        # anchors on trending_snapshots with no source filter), so the Solana instance already
+        # covers Robinhood's rows. PRUNE=0 on the secondary instance.
+        if PRUNE:
+            st, pruned = sb("POST", "/rpc/prune_trending_bars", {})
+        else:
+            st, pruned = 200, 0
         # The other two retention jobs run here too, on the same cadence, because this is the only
         # collector that already owns a server-side cleanup step. Measured at the time they were
         # added: `extra` was 35 MB of trending_snapshots' 41 MB and only the FIRST row per
@@ -631,7 +671,7 @@ def main():
         # point-in-time board record (rank, buy/sell counts, holder_count, bundler_rate as they
         # MOVE), and destroying it forecloses any study of how a token's features evolve after it
         # is first seen. The function stays deployed as a lever if storage ever binds again.
-        st_u, uni = sb("POST", "/rpc/prune_candidate_universe", {})
+        st_u, uni = sb("POST", "/rpc/prune_candidate_universe", {}) if PRUNE else (200, 0)
         print(f"pass done: {done} mints filled, {len(new_pools)} pools resolved, "
               f"{calls['n']} GT calls, pruned {pruned if st == 200 else f'FAILED({st})'} bars, "
               f"dropped {uni if st_u == 200 else f'FAILED({st_u})'} universe rows",

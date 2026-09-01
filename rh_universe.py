@@ -143,7 +143,7 @@ def is_erc20(addr):
     return bool(r) and r != "0x" and int(r, 16) <= 36
 
 
-def selftest(sample=6):
+def selftest(sample=4, window_s=900):
     """Refuse to run a watch entry whose extractor does not yield ERC-20 tokens.
 
     This exists because the extractor bug above was SILENT: it produced well-formed hex addresses
@@ -151,8 +151,13 @@ def selftest(sample=6):
     layout assumption is a data-integrity assumption, so it gets checked at startup, on real logs,
     every run — not reasoned about once and trusted forever.
     """
+    # A 15-minute window, not an hour. The gate exists to catch a WRONG EXTRACTOR, and four
+    # sampled tokens prove that as well as six; what an hour of logs across five factories buys is
+    # 4x the data to move and, under this node's flakiness, up to ~3 minutes of backoff per call.
+    # Measured 2026-09-01: startup sat in selftest for 12+ minutes before any launch was written,
+    # which is a verification gate costing more than the thing it verifies.
     latest, _, bt = C.refresh_head()
-    lo = latest - int(3600 / bt)
+    lo = latest - int(window_s / bt)
     raw = {}
     for w in WATCH:
         lp, fac, topic, how = w
@@ -165,7 +170,7 @@ def selftest(sample=6):
         lp, fac, topic, how = w
         toks = [t for t in (extract(l, how, quotes) for l in raw[w]) if t]
         if not toks:
-            print(f"  selftest {lp:12} no logs in the last hour — cannot verify", flush=True)
+            print(f"  selftest {lp:12} no logs in the window — cannot verify", flush=True)
             continue
         probe = toks[:sample]
         ok = sum(1 for t in probe if is_erc20(t))

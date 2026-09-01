@@ -104,6 +104,10 @@ PRUNE = os.environ.get("PRUNE", "1") not in ("0", "false", "")
 # and the front-loaded resolve phase steals budget and wall time from the fetch loop.
 RESOLVE_SKIP_ABOVE = int(os.environ.get("RESOLVE_SKIP_ABOVE", "1500"))
 
+# Mints first sighted within this many hours are ALWAYS resolved, however deep the fetch backlog is.
+# Resolution gates fetching, so deferring it for fresh sightings makes them permanently unscoreable.
+RESOLVE_ALWAYS_H = float(os.environ.get("RESOLVE_ALWAYS_H", "12"))
+
 # The scoring horizon, in seconds. MUST match backtest.HORIZON_H — the collector prioritises the
 # window the analysis actually scores, so if they disagree the collector optimises for the wrong one.
 HORIZON_S = float(os.environ.get("HORIZON_H", "3")) * 3600
@@ -601,9 +605,17 @@ def main():
         unfetched = sum(1 for m in first
                         if (pools.get(m) or {}).get("ok") and (have.get(m) or [None])[0] is None)
         if unres and unfetched > RESOLVE_SKIP_ABOVE:
-            print(f"  skipping pool resolution: {unfetched} resolved mints still have no bars "
-                  f"(> {RESOLVE_SKIP_ABOVE}); {len(unres)} unresolved can wait", flush=True)
-            unres = []
+            # NEVER skip a FRESH sighting. A mint cannot be fetched before it is resolved, so a
+            # blanket skip blocks exactly the entries the horizon-priority ordering exists to serve.
+            # Measured: with the blanket guard, pool coverage for mints first seen 3-6h ago fell
+            # from 72% to 12% in 90 minutes, so the freshest cohort could never become scoreable at
+            # all. Backfill can wait for the queue to drain; today's board cannot.
+            fresh = [m for m in unres if now - first[m] <= RESOLVE_ALWAYS_H * 3600]
+            print(f"  pool resolution: {unfetched} resolved mints still have no bars "
+                  f"(> {RESOLVE_SKIP_ABOVE}) — deferring {len(unres) - len(fresh)} backfill "
+                  f"resolutions, still resolving {len(fresh)} fresh (<{RESOLVE_ALWAYS_H}h) mints",
+                  flush=True)
+            unres = fresh
         if unres:
             cap = int(os.environ.get("RESOLVE_CALLS", "40")) * 30
             # Flush every FLUSH_EVERY records, NOT at the end of the loop. 120 calls is several

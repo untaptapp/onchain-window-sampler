@@ -283,12 +283,25 @@ def one_pass(quotes):
         print(f"  bookmark {mark:,} is at head {latest:,} — nothing to scan", flush=True)
         return 0
     rows, used, reached = scan(mark + 1, latest, MAX_CALLS, quotes)
-    got = fill_creators(rows, CREATOR_CALLS)
+    # WRITE THE LAUNCHES FIRST. `fill_creators` is up to CREATOR_CALLS sequential
+    # eth_getTransactionByHash calls — 400 of them at 0.25s pacing is 100s at best, and minutes
+    # once this node starts backing off. Doing it before the write put the ESSENTIAL data (the
+    # population at risk) behind an OPTIONAL enrichment: measured 2026-09-01, rh_launches sat
+    # unchanged for 51 minutes while the collector looked busy and healthy. `creator` is a
+    # nice-to-have for the fee-farming question; a missing launch row is a hole in the control arm.
     wrote = C.sb_write("/rh_launches?on_conflict=mint", rows)
     # Only advance the bookmark over the range actually scanned, and only AFTER the write lands —
     # C3: an interrupted pass must be re-doable, never silently skipped.
     if reached >= mark:
         write_bookmark(reached)
+    # Enrichment second, in its own write. tx_hash is already stored, so a creator missed here is
+    # recoverable on any later pass; a launch missed is not recoverable until the next scan.
+    got = fill_creators(rows, CREATOR_CALLS)
+    if got:
+        # Re-send the FULL rows, not {mint, creator}. PostgREST's merge-duplicates still attempts
+        # the INSERT, and NOT NULL on created_at/block_number/factory/topic0/first_seen_at is
+        # checked before conflict resolution — a partial payload would 400 the whole batch.
+        C.sb_write("/rh_launches?on_conflict=mint", [r for r in rows if r.get("creator")])
     span_h = (reached - mark) * bt / 3600
     print(f"  scanned blocks {mark + 1:,}..{reached:,} ({span_h:.1f}h): {len(rows)} launches, "
           f"{wrote} written, {got} creators resolved, {C.calls()} rpc calls, "

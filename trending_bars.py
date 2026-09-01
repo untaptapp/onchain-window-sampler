@@ -95,6 +95,10 @@ MIN_OBS = int(os.environ.get("MIN_OBS", "1"))
 #     = case; and (2) we could never test the second success criterion — whether a flagged token
 # that NEVER trends is still profitable — because we would have no price path for it.
 UNIVERSE_FRAC = float(os.environ.get("UNIVERSE_FRAC", "0.4"))
+# Which table supplies the control arm. `pump_launches` (Solana) or `rh_launches` (Robinhood).
+# This MUST track GT_NETWORK: the Solana tables carry no chain column, so pointing a Robinhood run
+# at them silently fills its queue with base58 mints that can never resolve on this network.
+CONTROL_SOURCE = os.environ.get("CONTROL_SOURCE", "pump_launches")
 
 # Retention is GLOBAL and must run from exactly one collector instance — see the call site.
 PRUNE = os.environ.get("PRUNE", "1") not in ("0", "false", "")
@@ -371,7 +375,35 @@ def main():
         # Sampled at random (not by rank) so the control pool stays an unbiased draw from the
         # population at risk — selecting "most active controls" would bias the comparison.
         controls = {}
-        if UNIVERSE_FRAC > 0:
+        if UNIVERSE_FRAC > 0 and CONTROL_SOURCE == "rh_launches":
+            # ROBINHOOD control arm. `pump_launches` and `candidate_universe` are both Solana
+            # tables with no chain column, so reading them here would put Solana mints in a
+            # Robinhood run's control queue — every one of them failing wrong_chain() and burning
+            # the call budget, which is exactly the cross-chain leak SOL_SOURCES exists to prevent
+            # on the case side. rh_launches is the Robinhood population at risk (85.7% recall
+            # against the board, measured 2026-09-01 — see rh_universe.py --audit).
+            #
+            # Age-matched to the cases as on Solana, and with the same rule: do NOT exclude mints
+            # that later trended. Eligibility at time t is an analysis-time decision (E10).
+            now_s = time.time()
+            lo, hi = int(now_s - 24 * 3600), int(now_s - 5 * 60)
+            for r in sb_all("/rh_launches?select=mint,created_at"
+                            f"&created_at=gte.{lo}&created_at=lte.{hi}&order=created_at.asc"):
+                m = (r.get("mint") or "").lower()
+                if m:
+                    controls[m] = r["created_at"]
+            import random as _r
+            _r.seed(int(now) // 3600)
+            keys = list(controls)
+            _r.shuffle(keys)
+            controls = {k: controls[k] for k in keys}
+            if not controls:
+                # An empty control arm on a chain that has a firehose means the firehose is not
+                # running, not that the population is empty. Say so rather than silently
+                # degrading to a case-only run (A-SHORT's lesson, applied to the other arm).
+                print("  !! CONTROL_SOURCE=rh_launches returned NO controls in the 1-24h window "
+                      "— is rh-universe running?", flush=True)
+        elif UNIVERSE_FRAC > 0:
             # PRIMARY control source: the pump.fun launch firehose. candidate_universe failed its
             # coverage gate (3.7-9.4%), while 84.3% of trending mints are pump.fun tokens, so
             # pump_launches is the population at risk. Sampled at RANDOM — choosing the most active
@@ -416,6 +448,23 @@ def main():
             keys = list(controls)
             _r.shuffle(keys)
             controls = {k: controls[k] for k in keys}
+        # The CONTROL arm gets the same chain check the case arm gets. `wrong_chain` is applied
+        # to `first` only, so a mis-set CONTROL_SOURCE (a Solana population table on a Robinhood
+        # run, or the reverse) would fill 40% of the queue with addresses that can never resolve
+        # on this network — one wasted GT call each, no error, and a control arm that silently
+        # collects nothing. An allowlist that only guards one arm is not an allowlist.
+        if controls:
+            bad_c = [m for m in controls if wrong_chain(m)]
+            if bad_c:
+                if len(bad_c) > len(controls) * 0.5:
+                    raise RuntimeError(
+                        f"CONTROL_SOURCE={CONTROL_SOURCE} vs GT_NETWORK={GT_NETWORK}: "
+                        f"{len(bad_c)}/{len(controls)} controls are the wrong chain — refusing")
+                print(f"  !! dropping {len(bad_c)}/{len(controls)} controls with the wrong address "
+                      f"shape for GT_NETWORK={GT_NETWORK}", flush=True)
+                for m in bad_c:
+                    del controls[m]
+
         # Least-covered first, so a budgeted run always makes progress and is resumable — but among
         # the mints with NO bars at all, newest sighting first.
         #

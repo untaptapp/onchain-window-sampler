@@ -40,6 +40,11 @@ declare n integer; begin
     union all
     select mint, min(created_at)       as t from pump_launches group by mint
     union all
+    -- Robinhood control arm. Without this anchor a control mint has no window at all, so its bars
+    -- are never trimmed and grow without bound; with it, the same [lo-pre_h, hi+post_h] rule that
+    -- governs the Solana arm applies on chain 4663 too.
+    select mint, min(created_at)       as t from rh_launches group by mint
+    union all
     select mint, max(captured_at)/1000 as t from trending_snapshots group by mint),
   w as (select mint, min(t) as lo, max(t) as hi from a group by mint),
   win as (
@@ -54,7 +59,8 @@ declare n integer; begin
     and (b.ts < win.lo - pre_h*3600 or b.ts > win.hi + win.ph*3600);
   get diagnostics n = row_count;
 
-  -- Bars for mints that no longer appear in ANY source table. pump_launches MUST be in this list:
+  -- Bars for mints that no longer appear in ANY source table. EVERY population table must be
+  -- listed -- pump_launches (Solana) and rh_launches (Robinhood):
   -- launch-sourced controls appear in no other table, so omitting it turns an orphan cleanup into a
   -- delete of the entire control arm. This became load-bearing once candidate_universe grew a
   -- retention window — without it, a control's bars are stranded forever once its universe row ages
@@ -62,7 +68,8 @@ declare n integer; begin
   delete from trending_bars b
   where not exists (select 1 from trending_snapshots s where s.mint = b.mint)
     and not exists (select 1 from candidate_universe c where c.mint = b.mint)
-    and not exists (select 1 from pump_launches p where p.mint = b.mint);
+    and not exists (select 1 from pump_launches p where p.mint = b.mint)
+    and not exists (select 1 from rh_launches r where r.mint = b.mint);
 
   return n;
 end $$;
@@ -101,3 +108,17 @@ declare n integer; begin
   get diagnostics n = row_count;
   return n;
 end $$;
+
+
+-- Robinhood launch-firehose retention. A launch that reached the board is a CASE and is kept
+-- regardless of age -- its row is the only record of which launchpad the token came from.
+create or replace function public.prune_rh_launches(keep_days integer default 21)
+ returns integer language plpgsql security definer as $function$
+declare n integer; begin
+  delete from rh_launches l
+   where l.created_at < extract(epoch from now()) - keep_days*86400
+     and not exists (select 1 from trending_snapshots s
+                      where s.mint = l.mint and s.source = 'gmgn_rh');
+  get diagnostics n = row_count;
+  return n;
+end $function$;

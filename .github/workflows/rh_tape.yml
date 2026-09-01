@@ -1,0 +1,48 @@
+name: rh-tape
+
+# WALLET-LEVEL TAPE for Robinhood Chain — who is actually buying, and is it the same wallet twice.
+#
+# Every feature the winner profile currently uses describes PRICE (GMGN board fields, OHLCV bars).
+# None of them can see the buyers. That matters because the profile we found — a token below its
+# own ATH with volume already flowing before the board lists it — is a volume story, and Bankr pays
+# 59% of trading fees to the deploying wallet, so manufacturing that exact signal is a funded
+# strategy. Verified on revival-aged tokens 2026-09-01: new_wallet_rate separates 0.885 (organic
+# buyer growth) from 0.125 (the same cohort recycling) on tokens whose price features look alike.
+#
+# Windows END at as_of and read nothing after it, so rows are admissible as features for a decision
+# made at that instant (D-POSTOBS). Case rows use as_of = first board sighting: the moment a
+# front-running model has to fire before.
+on:
+  schedule:
+    - cron: '25,55 * * * *'   # offset from rh-universe (:00,:30) — they share the public RPC
+  workflow_dispatch: {}
+
+concurrency:
+  group: rh-tape
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          # 6h of pre-entry history: the pre_vol feature that survived the holdout was measured
+          # over exactly this window, so the tape and the price features describe the same period.
+          WINDOW_S: '21600'
+          MAX_CALLS: '2500'
+          MAX_TOKENS: '400'
+          # Both arms, near the interleave the bars collector uses, so case and control rows
+          # accumulate together rather than the control arm perpetually trailing (E2).
+          CONTROL_FRAC: '0.4'
+          PASS_INTERVAL: '900'
+          RUN_SECONDS: '18000'
+          RPC_MIN_INTERVAL: '0.25'
+        run: python rh_tape.py

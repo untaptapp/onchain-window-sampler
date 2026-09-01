@@ -1,0 +1,55 @@
+name: rh-universe
+
+# ROBINHOOD CHAIN LAUNCH FIREHOSE — the population at risk, and the control arm for the
+# trending-prediction study on chain 4663.
+#
+# This is what `trending_bars_rh` has been waiting on: it runs with UNIVERSE_FRAC=0 because there
+# was no Robinhood control pool to sample from, so every Robinhood bar collected so far belongs to
+# a token that ALREADY trended. A case-only sample cannot answer "which token is about to trend" —
+# a model trained on it learns "is this token alive", not discrimination among live candidates (E1).
+#
+# Measured recall 2026-09-01: 85.7% of board mints born inside the scanned window are present
+# (pons_v2 90.9%, longxyz 80.0%). The Solana equivalent built on REST sweeps failed the same gate
+# at 3.7-9.4%, which is why that chain needed a launch firehose too.
+#
+# Backfilling is safe and cheap here — RPC logs are permanent — so a dropped run costs nothing but
+# latency. `--backfill N` reaches back N days without disturbing the forward bookmark.
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  # Its own group. cancel-in-progress FALSE: the work is resumable through rh_scan_state, so being
+  # killed mid-pass wastes RPC calls rather than losing data (contrast the board pollers, which are
+  # cancel-in-progress: true because their data cannot be backfilled at all).
+  group: rh-universe
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          BACKFILL_DAYS: '3'
+          MAX_CALLS: '4000'
+          CREATOR_CALLS: '400'
+          PASS_INTERVAL: '600'
+          RUN_SECONDS: '18000'
+          # The public RPC rate-limits, and the tape collector shares it. Pace both.
+          RPC_MIN_INTERVAL: '0.25'
+        run: python rh_universe.py
+      - name: recall audit
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python rh_universe.py --audit

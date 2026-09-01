@@ -39,10 +39,23 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           GT_NETWORK: 'robinhood'
           SOL_SOURCES: 'gmgn_rh'
-          # No control arm on this chain: candidate_universe and pump_launches are both Solana.
-          # Risk-set controls for Robinhood need the launch firehose (eth_getLogs on the launchpad
-          # factories) -- component 4 of research/robinhood-expansion.md, not yet built.
-          UNIVERSE_FRAC: '0'
+          # CONTROL ARM, live since 2026-09-01. `rh_universe.py` supplies the population at risk
+          # (85.7% recall against the board, `rh_universe.py --audit`), so this run can finally
+          # collect bars for tokens that did NOT trend. Until now every Robinhood bar belonged to a
+          # token that already had, which makes "which token is about to trend" unanswerable: a
+          # model fit on cases alone learns "is this token alive" (E1).
+          #
+          # CONTROL_SOURCE must track GT_NETWORK. pump_launches and candidate_universe carry no
+          # chain column, so leaving it at the default would queue base58 Solana mints on a
+          # Robinhood run -- each one failing wrong_chain() and burning budget. Same failure mode
+          # SOL_SOURCES prevents on the case side.
+          #
+          # Before switching this on, prune_trending_bars was taught about rh_launches. Its orphan
+          # delete removes bars for any mint absent from every population table, and a Robinhood
+          # control appears in none of the Solana ones -- so the pruner would have silently deleted
+          # this entire arm on every run (A13).
+          UNIVERSE_FRAC: '0.4'
+          CONTROL_SOURCE: 'rh_launches'
           # Retention runs from the Solana instance only; prune_trending_bars is global and a
           # full-table delete, so running it from both is contention for nothing.
           PRUNE: '0'

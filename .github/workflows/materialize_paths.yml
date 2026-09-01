@@ -15,7 +15,13 @@ on:
     # error anywhere. Materialisation is the only thing that turns bars into evaluable outcomes, so
     # a missed run directly delays the pre-registered test. Hourly gives the schedule slack to
     # absorb a dropped slot; the job is idempotent and cheap.
-    - cron: '25 * * * *'
+    # */20, not hourly. Hourly was chosen to "give the schedule slack to absorb a dropped slot",
+    # but GitHub drops them in runs, not singly: on 2026-09-01 the 01:25 AND 02:25 slots produced no
+    # run at all -- not cancelled, not queued, simply never created, with the concurrency group free
+    # and only 11 of a 20-job limit in use. I cannot explain why GitHub skipped them, so the answer
+    # is redundancy rather than a diagnosis: three slots an hour means two can vanish and scoring
+    # still advances. The job is idempotent and takes ~6 minutes, so extra slots cost nothing.
+    - cron: '*/20 * * * *'
   workflow_dispatch:
     inputs:
       keep_days:

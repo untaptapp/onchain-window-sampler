@@ -78,6 +78,21 @@ WATCH_DEFAULT = [
      "0x2ed5a8749a7e3a68a074750cc77850912a0708dc62ab7ea42b0c3e5beb36f017", "topic1"),
     ("amm_shared",  "0x8366a39cc670b4001a1121b8f6a443a643e40951",
      "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438", "pair"),
+    # Added 2026-09-02 after `--audit` showed them as live holes (o1_rwa 37% covered, bankr 38.5%).
+    # Verified before adding, not after: over a 15-minute window each yields 5/5 ERC-20 tokens at
+    # topic[1], at 864/day (o1_rwa) and 5,856/day (bankr) — small enough that neither floods the
+    # scan. o1_rwa emits the same launches from two contracts (a factory and a registry); both are
+    # watched because dedup is by mint, so the overlap costs one getLogs per chunk and nothing else.
+    ("o1_rwa",      "0x6a95911db04219674323aa0137c3377523c0e29f",
+     "0xca4da5ec8448afb7e0c9e8b124653a2a4146cfd2f5a8f9778f93cf206e0a5bc0", "topic1"),
+    ("o1_rwa",      "0xe64ac4113848bbc1a6dde1a6d1da96720a36f297",
+     "0x207384e895174175cc774fe7f7457b37c382f27ebf53d37d5257b862f80eaf9c", "topic1"),
+    ("bankr",       "0x4e3468951d49f2eea976ed0d6e75ffcb44a9a544",
+     "0x5be4f748347693e0500df872d81f7d96bce1b98e6f5adff0cfddfe3e9e415f20", "topic1"),
+    # NOT added: pons (0xcaf681a6…). The audit flags it at 5.6%, but the factory emits ZERO logs in
+    # a 15-minute window — it is a retired launchpad, so its uncovered board mints are a backfill
+    # DEPTH gap (they predate our scan), not a watch hole. Watching a dead contract would close
+    # nothing while making the audit look fixed.
 ]
 WATCH = [tuple(x) for x in json.loads(os.environ["RH_WATCH"])] if os.environ.get("RH_WATCH") \
     else WATCH_DEFAULT

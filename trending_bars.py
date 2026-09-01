@@ -103,6 +103,10 @@ PRUNE = os.environ.get("PRUNE", "1") not in ("0", "false", "")
 # is 30 mints/call and fetching is 1 mint/call, so without this the resolved pile grows every pass
 # and the front-loaded resolve phase steals budget and wall time from the fetch loop.
 RESOLVE_SKIP_ABOVE = int(os.environ.get("RESOLVE_SKIP_ABOVE", "1500"))
+
+# The scoring horizon, in seconds. MUST match backtest.HORIZON_H — the collector prioritises the
+# window the analysis actually scores, so if they disagree the collector optimises for the wrong one.
+HORIZON_S = float(os.environ.get("HORIZON_H", "3")) * 3600
 # The GeckoTerminal network. Robinhood Chain (id 4663) is served under `robinhood` — verified live
 # 2026-09-01: /networks/robinhood/tokens/multi/ returned 30/30 board mints with pools
 # (uniswap-v4-robinhood, pons-v2-dex, bankr-robinhood), and /pools/<addr>/ohlcv/minute returned
@@ -512,6 +516,15 @@ def main():
         def staleness(m):
             return max(have[m][1] or 0, (pools.get(m) or {}).get("last_fetch_to") or 0)
 
+        def horizon_gap(m, t0):
+            """Seconds of the SCORING window [t0, t0+HORIZON_H] that have already elapsed in the
+            world but that we have not requested. A mint with a positive gap is ONE FETCH away from
+            being a scored trade; a mint with zero is not, however incomplete it looks."""
+            need = t0 + HORIZON_S
+            if now < need:
+                return 0                     # horizon has not elapsed — those bars do not exist yet
+            return max(0, need - max((pools.get(m) or {}).get("last_fetch_to") or 0, t0))
+
         # Ties (everything at the deficit cap) break on oldest-data-first, then NEWEST SIGHTING
         # first. That last term used to be implicit — Python's stable sort left tied mints in
         # `first`'s insertion order, which is captured_at ASCENDING, i.e. oldest first. With a
@@ -519,8 +532,30 @@ def main():
         # every brand-new sighting behind the entire historical backlog. The backlog is
         # backfillable from GeckoTerminal at any time; a fresh sighting is what the forward test
         # is made of, so it goes first and the backlog drains with whatever budget is left.
-        todo = sorted(first.items(),
-                      key=lambda kv: (-deficit(kv[0], kv[1]), staleness(kv[0]), -kv[1]))
+        # SCOREABLE-IF-FETCHED FIRST, then most-incomplete.
+        #
+        # Seconds-of-missing-window alone starved exactly the entries the forward test is made of.
+        # A fresh mint is fetched once, minutes after its first sighting, covering ~0-5 minutes past
+        # entry — and that sets last_fetch_to to a RECENT time, so `staleness` immediately sorts it
+        # behind the entire backlog. The newest-first rule only breaks ties among NEVER-touched
+        # mints, so a mint that has been touched once is never re-visited while it is young, and its
+        # window is never extended to t0+HORIZON. Measured 2026-09-01: of gmgn mints first seen 3-6h
+        # ago, 72% had a resolved pool and 0% had bars through t0+3h; 6-12h ago, 6%.
+        #
+        # horizon_gap makes the distinction the deficit cannot: a mint whose scoring window has
+        # elapsed but is unfetched is one call from being an evaluable trade. Everything else —
+        # backfill, open-window extension beyond the horizon, the pre-window — is genuinely less
+        # urgent, because GeckoTerminal serves it whenever we get to it.
+        def sort_key(kv):
+            m, t0 = kv
+            if horizon_gap(m, t0) > 0:
+                return (0, -t0, 0.0, 0.0)          # newest first among the scoreable
+            return (1, -deficit(m, t0), staleness(m), -t0)
+
+        todo = sorted(first.items(), key=sort_key)
+        n_urgent = sum(1 for kv in first.items() if horizon_gap(*kv) > 0)
+        print(f"  {n_urgent} mints are one fetch from being scoreable (horizon elapsed, "
+              f"not yet requested) — those go first", flush=True)
         ctrl_todo = list(controls.items())
         # INTERLEAVE, don't append. Concatenating controls after every case made them structurally
         # unreachable: with hundreds of cases queued ahead of them, no finite call budget ever

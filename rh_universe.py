@@ -369,13 +369,26 @@ def main():
         i = sys.argv.index("--backfill")
         backfill(float(sys.argv[i + 1]) if len(sys.argv) > i + 1 else BACKFILL_DAYS)
         return
-    quotes = selftest()
+    # The selftest must be INSIDE the retry loop. It calls eth_getLogs, and the public RPC serves
+    # sustained "internal server errror" bursts that outlast rpc()'s seven retries — so running it
+    # once at startup made a transient node condition permanently fatal: a 5-hour collector died
+    # 30 seconds in, having verified nothing and collected nothing.
+    #
+    # Distinguish the two failures, because they deserve opposite responses. "The extractor yields
+    # non-ERC-20s" is a DATA-INTEGRITY verdict and must still abort (SystemExit, raised inside
+    # selftest and re-raised here untouched). "We could not reach the node to check" is not a
+    # verdict at all — it is an absent measurement (F5), so it retries like any other pass failure.
+    quotes = None
     end = time.time() + RUN_SECONDS
     fails = 0
     while True:
         try:
+            if quotes is None:
+                quotes = selftest()
             one_pass(quotes)
             fails = 0
+        except SystemExit:
+            raise                      # extractor verdict — never retried away
         except Exception as ex:
             fails += 1
             print(f"pass error ({fails}): {ex!r}", flush=True)
@@ -385,7 +398,10 @@ def main():
                 raise SystemExit(f"{fails} consecutive pass failures — refusing to zombie")
         if time.time() >= end:
             break
-        time.sleep(PASS_INTERVAL)
+        # Back off FAST after a failure, not a full pass interval: the node's blips clear in
+        # seconds, and waiting 10 minutes to retry turns a 30-second outage into 30 minutes of
+        # lost collection.
+        time.sleep(min(60 * max(fails, 1), PASS_INTERVAL) if fails else PASS_INTERVAL)
     print("done", flush=True)
 
 

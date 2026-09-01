@@ -153,10 +153,21 @@ def measure(mint, as_of, window_s, creator=None, born_block=None):
     logs = C.get_logs({"address": mint, "topics": [C.TRANSFER],
                        "fromBlock": hex(max(0, b_lo)), "toBlock": hex(max(0, b_hi))})
     tr = decode(logs)
-    if not tr:
-        return None
-    # Flag, never truncate. Slicing the list would keep only the EARLIEST logs and quietly turn
-    # every downstream ratio into a statement about the start of the window.
+    # A token that did not trade in the window is an OBSERVATION, not a missing row.
+    #
+    # The first version returned None here, and it silently emptied the control arm: measured
+    # 2026-09-01, rh_tape held 106 case rows and ZERO control rows, because a random launch usually
+    # has no transfers in a 6h window and every one of them was dropped. That is the worst possible
+    # bias for this study — it keeps only the ACTIVE controls, so cases and controls end up looking
+    # alike on exactly the volume/breadth features the winner profile keys on, and the arm that is
+    # supposed to prove discrimination quietly proves nothing (E2: both arms need identical feature
+    # quality; E4: report drop-out rather than hiding it).
+    #
+    # Zero-filling is only safe because `None` here means the RPC SUCCEEDED and returned no logs.
+    # A failed query raises out of get_logs above and never reaches this line, so we can never
+    # record "no trading" when what actually happened was "we could not ask" (F5).
+    # `features()` already yields real zeros for the counts and NULL for ratios that are undefined
+    # without trades, which is exactly the right shape for a silent token.
     truncated = len(logs) > LOG_CAP
     pool, share = infer_pool(tr)
     # Wallets active BEFORE the window, so "new wallet" means new to this token rather than merely

@@ -270,6 +270,7 @@ def load_launch_meta():
 
 
 def one_pass():
+    C.reset_calls()          # MAX_CALLS is a PER-PASS budget, not a lifetime one
     C.refresh_head()
     load_launch_meta()
     q = build_queue()

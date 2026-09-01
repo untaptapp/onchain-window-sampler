@@ -41,8 +41,14 @@ class RpcError(RuntimeError):
 # killed a 3-day backfill partway through. B-RPC still holds for real answers ("log query timed
 # out", "limit exceeded"): those must never be retried unchanged, which is what get_logs' bisection
 # is for. So classify rather than treat every error object the same way.
+# NOTE the deliberately loose "internal server err" — the node emits it MISSPELLED as
+# "internal server errror", and matching the correct spelling alone would let a very common blip
+# through as if it were a real answer about the request. Measured 2026-09-01: this single unlisted
+# string silently stopped rh_universe writing launches for ~2h while the workflow stayed green and
+# the scan bookmark kept advancing on the passes that happened to succeed.
 _TRANSIENT = ("connection refused", "eof", "dial tcp", "context deadline", "connection reset",
-              "no such host", "i/o timeout", "bad gateway", "service unavailable")
+              "no such host", "i/o timeout", "bad gateway", "service unavailable",
+              "internal server err", "try again", "temporarily unavailable", "too many requests")
 
 
 def _is_transient(msg):
@@ -55,6 +61,16 @@ _c = {"n": 0, "t": 0.0, "429": 0}
 
 def calls():
     return _c["n"]
+
+
+def reset_calls():
+    """Zero the per-pass call counter.
+
+    `_c["n"]` is process-global and only ever increments, so a collector that compares it against
+    an absolute MAX_CALLS budget works for exactly one pass and then silently does nothing for the
+    rest of a 5-hour run — green workflow, no output, no error (C4). Every self-polling collector
+    must reset at the top of each pass, the way trending_bars.py does."""
+    _c["n"] = 0
 
 
 def throttled():

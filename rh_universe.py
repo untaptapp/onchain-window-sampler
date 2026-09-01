@@ -268,6 +268,7 @@ def fill_creators(rows, budget):
 
 
 def one_pass(quotes):
+    C.reset_calls()          # MAX_CALLS is a PER-PASS budget, not a lifetime one
     latest, _, bt = C.refresh_head()
     mark = read_bookmark()
     if mark is None:

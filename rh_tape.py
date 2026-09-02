@@ -63,6 +63,13 @@ MIN_LEAD_EXPOSURE_S = int(os.environ.get("MIN_LEAD_EXPOSURE_S", "60"))
 # either -- they are the anchor every lead is measured relative to -- so this is a split, not a
 # priority.
 LEAD_FRAC = float(os.environ.get("LEAD_FRAC", "0.5"))
+# Rows per flush. This was 100, chosen when a token cost ~3 RPC calls and a couple of seconds. A
+# token now costs ~20 calls and 20-47s (bracketed ts_to_blk, the wallet probes, 429 backoff), so 100
+# rows is ~78 MINUTES between writes -- and a pass interrupted before its first flush loses
+# everything and looks, from outside, exactly like a collector doing nothing. I cancelled and
+# redispatched this job four times on that mistaken reading, resetting the clock each time. Flush
+# cadence must track the cost of the work, not a number fixed when the work was cheap (C3).
+FLUSH_EVERY = int(os.environ.get("FLUSH_EVERY", "20"))
 # WALLET EXPERIENCE — "new to the CHAIN", not "new to this token".
 #
 # `new_wallet_rate` is degenerate by construction: it asks whether a buyer held THIS token before,
@@ -567,7 +574,7 @@ def one_pass():
     if not q:
         print("  queue empty", flush=True)
         return 0
-    rows, skipped = [], 0
+    rows, skipped, done_n, t_pass = [], 0, 0, time.time()
     for mint, as_of, arm, lead in q:
         if C.calls() >= MAX_CALLS:
             break
@@ -587,7 +594,11 @@ def one_pass():
         # would mix a description of board inclusion with a prediction of it.
         f["lead_s"] = int(lead)
         rows.append(f)
-        if len(rows) >= 100:                              # C3: flush on the same cadence as work
+        done_n += 1
+        if done_n % 10 == 0:
+            print(f"    .. {done_n}/{len(q)} measured, {C.calls()} rpc, {C.throttled()} x429, "
+                  f"{time.time() - t_pass:.0f}s", flush=True)
+        if len(rows) >= FLUSH_EVERY:                      # C3: flush on the same cadence as work
             C.sb_write("/rh_tape?on_conflict=mint,as_of,window_s", rows)
             print(f"    .. {len(rows)} rows flushed, {C.calls()} rpc calls", flush=True)
             rows = []

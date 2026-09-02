@@ -50,3 +50,13 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           KEEP_DAYS: ${{ github.event.inputs.keep_days || '0' }}
         run: python materialize_paths.py
+      # Robinhood is a SEPARATE step, not an extra call inside materialize_paths.py, and it runs
+      # even when the Solana step fails. The two share no code: the Solana path needs SOL
+      # denomination and Jupiter quotes, which do not exist on this chain. Before this existed
+      # trending_paths held ZERO EVM rows -- every derived return in the project was Solana-only.
+      - name: run-robinhood
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python materialize_rh.py

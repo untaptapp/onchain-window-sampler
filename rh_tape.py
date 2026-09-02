@@ -95,8 +95,14 @@ FLUSH_EVERY = int(os.environ.get("FLUSH_EVERY", "20"))
 # per-token cost and therefore into how long the 4,872-task LEAD backfill takes -- and the front-run
 # question the leads answer is worth more right now than a wider buyer sample. Raise it once the
 # lead backlog is drained.
-WALLET_PROBE_K = int(os.environ.get("WALLET_PROBE_K", "3"))     # 0 disables the probe entirely
-WALLET_LOOKBACK_BLOCKS = int(os.environ.get("WALLET_LOOKBACK_BLOCKS", "6000000"))   # ~7 days
+# DEFAULT 0 -- OFF. This probe has now had three rounds of cost pathology (unbounded scan from
+# block 0; then a bounded window that still bisected into hundreds of calls; one token spent 611
+# calls and 28 minutes in it) and it blocked the ESSENTIAL work -- the 5,898-task lead backfill that
+# answers the front-run question -- for five hours while every dashboard stayed green. An optional
+# feature sharing a pass budget spends the essential feature's money. It stays off until a clean
+# WORST-CASE measurement exists; set WALLET_PROBE_K=3 to re-enable.
+WALLET_PROBE_K = int(os.environ.get("WALLET_PROBE_K", "0"))     # 0 disables the probe entirely
+WALLET_LOOKBACK_BLOCKS = int(os.environ.get("WALLET_LOOKBACK_BLOCKS", "900000"))  # ~1 day
 # Controls are matched to cases on BIRTH TIME as well as age; this is the half-width of the birth
 # bracket a candidate control must fall inside. Launch supply is ~21k/day (~15/min), so +/-30 min
 # offers ~900 candidates per case — deep enough that matching almost never fails.
@@ -229,8 +235,17 @@ def wallet_prior(w, b_lo):
     if lo >= b_lo:
         return None
     try:
-        return bool(C.get_logs({"topics": [C.TRANSFER, None, topic],
-                                "fromBlock": hex(lo), "toBlock": hex(b_lo - 1)}))
+        # C.rpc, NOT C.get_logs. get_logs BISECTS on a timeout, which is right when you need every
+        # log in a range and catastrophic here: this query has no address filter, so the node scans
+        # the whole range and times out on busy wallets, and the bisection fans one probe out into
+        # hundreds of calls. Measured: a single token spent 611 RPC calls and 28 MINUTES in this
+        # function while every other token in the pass took 3 seconds and 2 calls -- one pathological
+        # wallet ate an entire pass budget, which is why the collector never reached a flush.
+        # This probe wants a cheap best-effort answer, so a timeout is "unknown" (None), not a reason
+        # to try harder. Bounding the WINDOW was not enough; the call count needed bounding too.
+        r = C.rpc("eth_getLogs", [{"topics": [C.TRANSFER, None, topic],
+                                   "fromBlock": hex(lo), "toBlock": hex(b_lo - 1)}], tries=2)
+        return bool(r)
     except Exception:
         return None
 

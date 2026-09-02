@@ -47,7 +47,15 @@ PRIOR_LOOKBACK_S = int(os.environ.get("PRIOR_LOOKBACK_S", "604800"))   # 7 days
 # way to tell prediction from description. Bounded by the token's age at board entry, which on this
 # chain is p25 2.9 min / p50 6.6 min / p75 12.4 min -- so the grid is seconds-to-minutes. Each lead
 # is scored on the cases old enough to admit it, which is a DIFFERENT subpopulation per lead.
-LEADS = [int(x) for x in os.environ.get("LEADS", "60,120,300").split(",") if x.strip()]
+# The grid spans SECONDS to an HOUR because there are two different strategies here with two
+# different ceilings. 90.0% of board entrants are fresh launches (<30 min old, median 5.6 min), and
+# for those the lead can only ever be minutes. But the REVIVAL cohort -- a token woken from the dead,
+# which is Track A's whole thesis -- is 2.3% of dated entrants at >=6h old (p50 14.0h, max 3.2d), and
+# for those a 15/30/60-minute lead is entirely feasible. A single short grid would have silently
+# tested only the fresh strategy. Each L is filtered per token by `age - L >= MIN_LEAD_EXPOSURE_S`,
+# so long leads simply do not apply to young tokens rather than producing garbage rows.
+LEADS = [int(x) for x in
+         os.environ.get("LEADS", "60,120,300,900,1800,3600").split(",") if x.strip()]
 # A lead row still needs a window to measure. Stepping back to within a few seconds of birth leaves
 # nothing but the mint Transfer, which is not an observation about trading.
 MIN_LEAD_EXPOSURE_S = int(os.environ.get("MIN_LEAD_EXPOSURE_S", "60"))
@@ -357,7 +365,17 @@ def build_queue():
     take_e = cases[:n_entry]
     take_l = leads[:n_lead + (n_entry - len(take_e))]          # unused entry slots go to leads
     take_e = cases[:n_case - len(take_l)]                      # and unused lead slots come back
-    cases = take_e + take_l
+    # INTERLEAVE entry and lead tasks, do not concatenate. A quota reserves SLOTS; it does not
+    # reserve WORK. `take_e + take_l` puts every lead behind 120 entries, so a pass that exhausts
+    # MAX_CALLS partway through still never reaches one -- the same starvation the quota was added
+    # to fix, and the identical defect this file already documents for cases vs controls.
+    mixed, i, j = [], 0, 0
+    while i < len(take_e) or j < len(take_l):
+        if i < len(take_e):
+            mixed.append(take_e[i]); i += 1
+        if j < len(take_l):
+            mixed.append(take_l[j]); j += 1
+    cases = mixed
     controls = []
     unmatched = 0
     if n_ctrl > 0 and cases:

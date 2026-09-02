@@ -78,11 +78,27 @@ WATCH_DEFAULT = [
      "0x2ed5a8749a7e3a68a074750cc77850912a0708dc62ab7ea42b0c3e5beb36f017", "topic1"),
     ("amm_shared",  "0x8366a39cc670b4001a1121b8f6a443a643e40951",
      "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438", "pair"),
-    # Added 2026-09-02 after `--audit` showed them as live holes (o1_rwa 37% covered, bankr 38.5%).
-    # Verified before adding, not after: over a 15-minute window each yields 5/5 ERC-20 tokens at
-    # topic[1], at 864/day (o1_rwa) and 5,856/day (bankr) — small enough that neither floods the
-    # scan. o1_rwa emits the same launches from two contracts (a factory and a registry); both are
+    # Added 2026-09-02 after `--audit` showed both under 40% covered. Each yields 5/5 ERC-20 tokens
+    # at topic[1] over a 15-minute window, at 864/day (o1_rwa) and 5,856/day (bankr).
+    #
+    # o1_rwa was a REAL hole and adding it worked: coverage 37% -> 54.7% within one pass, still
+    # climbing. It emits the same launches from two contracts (a factory and a registry); both are
     # watched because dedup is by mint, so the overlap costs one getLogs per chunk and nothing else.
+    #
+    # bankr was NOT a real hole, and the audit misled me about it. Measured 2026-09-02 over a live
+    # 15-minute window: bankr emits 56 tokens and **100% of them are also emitted by longxyz**, so
+    # bankr is a front-end on the Long launchpad rather than an independent one. `scan()` walks
+    # WATCH in order and skips a mint already claimed (`mint in out`), so longxyz — earlier in this
+    # list — has been collecting these all along under its own label. The audit groups by GMGN's
+    # board `launchpad` field, so the same mint reads as "bankr" on the board and "longxyz" here:
+    # what looked like a coverage hole was a LABEL MISMATCH. Adding the entry closed nothing
+    # (coverage 38.5% -> 35.7% on n=14, i.e. noise). It is kept because it is cheap and it is the
+    # evidence, but note the consequence: `launchpad` in rh_launches CANNOT distinguish bankr from
+    # longxyz, so never group an analysis by it and expect the board's split.
+    #
+    # The lesson generalises: a per-launchpad coverage number compares OUR label to THEIRS, and a
+    # low cell means the labels disagree OR the mints are missing. Check which before adding a
+    # watch entry — a mint already collected under another name needs no new contract.
     ("o1_rwa",      "0x6a95911db04219674323aa0137c3377523c0e29f",
      "0xca4da5ec8448afb7e0c9e8b124653a2a4146cfd2f5a8f9778f93cf206e0a5bc0", "topic1"),
     ("o1_rwa",      "0xe64ac4113848bbc1a6dde1a6d1da96720a36f297",

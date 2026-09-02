@@ -43,6 +43,14 @@ CONTROL_FRAC = float(os.environ.get("CONTROL_FRAC", "0.4"))
 LOG_CAP = int(os.environ.get("LOG_CAP", "12000"))
 # How far back to look for prior holders when the token's birth block is unknown.
 PRIOR_LOOKBACK_S = int(os.environ.get("PRIOR_LOOKBACK_S", "604800"))   # 7 days
+# Front-run leads, seconds. A lead row measures a token at `board_sighting - L`, which is the only
+# way to tell prediction from description. Bounded by the token's age at board entry, which on this
+# chain is p25 2.9 min / p50 6.6 min / p75 12.4 min -- so the grid is seconds-to-minutes. Each lead
+# is scored on the cases old enough to admit it, which is a DIFFERENT subpopulation per lead.
+LEADS = [int(x) for x in os.environ.get("LEADS", "60,120,300").split(",") if x.strip()]
+# A lead row still needs a window to measure. Stepping back to within a few seconds of birth leaves
+# nothing but the mint Transfer, which is not an observation about trading.
+MIN_LEAD_EXPOSURE_S = int(os.environ.get("MIN_LEAD_EXPOSURE_S", "60"))
 # Controls are matched to cases on BIRTH TIME as well as age; this is the half-width of the birth
 # bracket a candidate control must fall inside. Launch supply is ~21k/day (~15/min), so +/-30 min
 # offers ~900 candidates per case — deep enough that matching almost never fails.
@@ -278,20 +286,64 @@ def build_queue():
     A silent matched control is a REAL observation ("launched alongside it, never traded, never
     trended") and is kept. Only mistimed silence was ever the problem.
     """
-    done = {(r["mint"], r["as_of"]) for r in
-            C.sb_all(f"/rh_tape?window_s=eq.{WINDOW_S}&select=mint,as_of")}
-    snaps = C.sb_all("/trending_snapshots?source=eq.gmgn_rh&select=mint,captured_at"
-                     "&order=captured_at.asc")
-    first = {}
-    for r in snaps:
-        first.setdefault(r["mint"].lower(), r["captured_at"] / 1000)
+    # Both of these are append-only, so read incrementally and keep the maps between passes.
+    hw = _META_HW["done"]
+    for r in C.sb_all(f"/rh_tape?window_s=eq.{WINDOW_S}&select=mint,as_of,computed_at"
+                      f"&order=computed_at.asc,mint.asc,as_of.asc"
+                      + (f"&computed_at=gte.{hw}" if hw else "")):
+        _DONE.add((r["mint"], r["as_of"]))
+        _META_HW["done"] = max(_META_HW["done"], int(r.get("computed_at") or 0))
+    # captured_at is a bigint of MILLISECONDS. Keeping the high-water mark as a float rendered it
+    # as "1788349257495.0" in the filter and PostgREST rejected the whole page with 22P02 -- loudly,
+    # because sb_all raises, which is the only reason this was a one-line fix and not a silent
+    # short read. Keep the mark in the column's own type and unit.
+    hws = int(_META_HW["snap"])
+    for r in C.sb_all("/trending_snapshots?source=eq.gmgn_rh&select=mint,captured_at"
+                      "&order=captured_at.asc,mint.asc"
+                      + (f"&captured_at=gte.{hws}" if hws else "")):
+        _FIRST.setdefault(r["mint"].lower(), r["captured_at"] / 1000)
+        _META_HW["snap"] = max(int(_META_HW["snap"]), int(r["captured_at"]))
+    done, first = _DONE, _FIRST
     now = time.time()
-    cases = [(m, int(t), "case") for m, t in first.items()
+    cases = [(m, int(t), "case", 0) for m, t in first.items()
              if (m, int(t)) not in done and t < now - 300]
     cases.sort(key=lambda x: -x[1])                       # newest board entries first
+
+    # LEAD ROWS — the actual front-running test.
+    #
+    # A row measured at as_of = first board sighting cannot distinguish "the tape PREDICTS board
+    # entry" from "the tape DESCRIBES it": the token is on the board largely because it is trading,
+    # and GMGN's inclusion criteria are undocumented. The only way to tell is to measure the same
+    # token at as_of - L and ask whether the separation survives a tradeable lead (D-POSTOBS).
+    #
+    # The lead is bounded by the token's own age at board entry, and on this chain that is SHORT:
+    # measured over 2,262 dated board mints, age at entry is p25 2.9 min, p50 6.6 min, p75 12.4 min.
+    # A 15-minute lead is physically possible for only 16.9% of cases. So the grid is seconds-to-
+    # minutes, not hours -- and each lead is evaluated on a DIFFERENT subpopulation (the cases old
+    # enough to admit it), which is a composition shift that must be reported with n, never pooled.
+    leads = []
+    for m, t, _a, _l in list(cases) + [(m, int(t), "case", 0) for m, t in first.items()]:
+        b = BORN_TS.get(m)
+        if b is None:
+            continue
+        age = int(t) - b
+        for L in LEADS:
+            if age - L < MIN_LEAD_EXPOSURE_S:     # no window left after stepping back
+                continue
+            a_l = int(t) - L
+            if (m, a_l) in done or a_l > now - 300:
+                continue
+            leads.append((m, a_l, "case", L))
+    seen_l = set()
+    leads = [x for x in leads if not (x[:2] in seen_l or seen_l.add(x[:2]))]
+    leads.sort(key=lambda x: -x[1])
+    _lead_supply[:] = [len(leads), len(cases)]
+    # Board-entry rows first (they are the anchor every lead row is relative to), then leads fill
+    # whatever budget is left. Case supply is nearly exhausted -- 3,855 of 4,087 board mints already
+    # measured -- so without leads the collector idles with capacity to spare.
     n_ctrl = int(MAX_TOKENS * CONTROL_FRAC)
     n_case = MAX_TOKENS - n_ctrl
-    cases = cases[:n_case]
+    cases = (cases + leads)[:n_case]
     controls = []
     unmatched = 0
     if n_ctrl > 0 and cases:
@@ -304,7 +356,7 @@ def build_queue():
         pool_ = sorted(((b, m) for m, b in BORN_TS.items() if m not in first), key=lambda x: x[0])
         births = [p[0] for p in pool_]
         used = set()
-        for m, t, _arm in cases:
+        for m, t, _arm, lead in cases:
             if len(controls) >= n_ctrl:
                 break
             b = BORN_TS.get(m)
@@ -336,13 +388,18 @@ def build_queue():
                 if (cm, t_c) in done:
                     continue
                 used.add(cm)
-                controls.append((cm, t_c, "control"))
+                # Same point in the control's own life, so a lead row on the case side is compared
+                # against a control observed the same distance before ITS matched moment.
+                controls.append((cm, t_c, "control", lead))
                 break
             else:
                 unmatched += 1
     if unmatched:
         print(f"  {unmatched} cases could not be age-matched (no candidate in the birth bracket)",
               flush=True)
+    if _lead_supply:
+        print(f"  lead supply: {_lead_supply[0]:,} tasks outstanding across L={LEADS} "
+              f"(entry backlog {_lead_supply[1]:,})", flush=True)
     # INTERLEAVE, don't append — the same defect trending_bars.py already carries a comment about.
     # `cases + controls` puts every control behind 240 cases, so a pass that runs out of calls or
     # wall-clock never reaches one: measured, rh_tape held 106 case rows and 0 control rows. Round
@@ -363,17 +420,39 @@ def build_queue():
 
 
 CREATOR, BORN, BORN_TS = {}, {}, {}
+# High-water marks for the incremental caches below. Every one of these tables only ever GAINS rows,
+# so re-reading them whole on every pass is pure waste that grows with the study: measured
+# 2026-09-02, one pass spent ~121 HTTP round trips (81 pages of rh_launches + 33 of snapshots + 7 of
+# rh_tape) before doing any work, and rh_launches alone adds ~8 pages/day forever (A6). Keep the
+# maps across passes and fetch only what is new.
+_META_HW = {"launch": 0, "snap": 0.0, "done": 0}
+_FIRST, _DONE = {}, set()
+_lead_supply = []          # [outstanding lead tasks, outstanding board-entry tasks] for logging
 
 
 def load_launch_meta():
     """Deployer, birth block and birth TIME per known launch. The deployer drives creator_share
     (the fee-farming question), the birth block bounds the prior-holder scan and clamps the
     measurement window, and the birth time is what controls are age-matched on."""
-    CREATOR.clear(); BORN.clear(); BORN_TS.clear()
-    for r in C.sb_all("/rh_launches?select=mint,creator,block_number,created_at,birth_kind"):
+    # Incremental: only rows first seen since the last pass. `creator` is backfilled onto existing
+    # rows by rh_universe, so re-read a small trailing overlap rather than assuming append-only
+    # content -- the overlap is cheap and a missed creator only weakens creator_share, never
+    # corrupts an identity.
+    hw = _META_HW["launch"]
+    flt = f"&first_seen_at=gte.{hw - 3600}" if hw else ""
+    got = 0
+    for r in C.sb_all("/rh_launches?select=mint,creator,block_number,created_at,birth_kind,"
+                      f"first_seen_at&order=first_seen_at.asc,mint.asc{flt}"):
+        got += 1
+        _META_HW["launch"] = max(_META_HW["launch"], int(r.get("first_seen_at") or 0))
         m = r["mint"].lower()
         if r.get("creator"):
             CREATOR[m] = r["creator"].lower()
+        # A mint whose birth_kind is not 'launchpad' must be REMOVED if it was cached earlier as
+        # one: rh_universe can relabel a row, and a stale launchpad birth would silently re-admit
+        # the pool-timestamp bug this cache is meant to keep out.
+        if r.get("birth_kind") != "launchpad":
+            BORN.pop(m, None); BORN_TS.pop(m, None)
         # ONLY a launchpad row dates a birth. A `pair`-sourced row records when a pool appeared on
         # a shared AMM, which is an upper bound: 71.7% of amm_shared board mints were sighted BEFORE
         # it, median 14.4h before. Trusting it would (a) clamp the measurement window to well after
@@ -398,7 +477,7 @@ def one_pass():
         print("  queue empty", flush=True)
         return 0
     rows, skipped = [], 0
-    for mint, as_of, arm in q:
+    for mint, as_of, arm, lead in q:
         if C.calls() >= MAX_CALLS:
             break
         try:
@@ -413,6 +492,9 @@ def one_pass():
             skipped += 1
             continue
         f["arm"] = arm
+        # 0 = measured AT board entry; >0 = measured that many seconds BEFORE it. Pooling the two
+        # would mix a description of board inclusion with a prediction of it.
+        f["lead_s"] = int(lead)
         rows.append(f)
         if len(rows) >= 100:                              # C3: flush on the same cadence as work
             C.sb_write("/rh_tape?on_conflict=mint,as_of,window_s", rows)
@@ -420,7 +502,8 @@ def one_pass():
             rows = []
     wrote = C.sb_write("/rh_tape?on_conflict=mint,as_of,window_s", rows)
     ncase = sum(1 for x in q if x[2] == "case")
-    print(f"  pass: queue {len(q)} ({ncase} case / {len(q) - ncase} control), "
+    nlead = sum(1 for x in q if x[3])
+    print(f"  pass: queue {len(q)} ({ncase} case / {len(q) - ncase} control, {nlead} lead), "
           f"{wrote} final rows, {skipped} unreadable, {C.calls()} rpc, {C.throttled()} x429",
           flush=True)
     return wrote

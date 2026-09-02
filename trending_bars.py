@@ -320,7 +320,7 @@ def main():
         # each failure as ok=false in trending_pools. An allowlist rather than a denylist so the
         # next chain we add fails closed — invisible to this collector until deliberately included.
         snaps = sb_all(f"/trending_snapshots?source=in.({SOL_SOURCES})"
-                       "&select=mint,captured_at&order=captured_at.asc")
+                       "&select=mint,captured_at&order=captured_at.asc,mint.asc")
         first, last, nobs = {}, {}, defaultdict(int)
         for r in snaps:
             m, t = r["mint"], r["captured_at"] / 1000
@@ -388,7 +388,7 @@ def main():
             now_s = time.time()
             lo, hi = int(now_s - 24 * 3600), int(now_s - 5 * 60)
             for r in sb_all("/rh_launches?select=mint,created_at"
-                            f"&created_at=gte.{lo}&created_at=lte.{hi}&order=created_at.asc"):
+                            f"&created_at=gte.{lo}&created_at=lte.{hi}&order=created_at.asc,mint.asc"):
                 m = (r.get("mint") or "").lower()
                 if m:
                     controls[m] = r["created_at"]
@@ -425,7 +425,7 @@ def main():
             # mint is an eligible control at a given moment is an ANALYSIS-time decision
             # (eligible iff first_trend > t), not a collection-time filter.
             for r in sb_all("/pump_launches?select=mint,created_at"
-                            f"&created_at=gte.{lo}&created_at=lte.{hi}&order=created_at.asc"):
+                            f"&created_at=gte.{lo}&created_at=lte.{hi}&order=created_at.asc,mint.asc"):
                 m = r.get("mint")
                 if m:
                     controls[m] = r["created_at"]
@@ -434,7 +434,7 @@ def main():
             # from one moment — not a sample of the population at risk across the study period.
             # secondary pool: still valid, just size-biased toward mega-caps and brand-new pools
             uni = sb_all("/candidate_universe?select=mint,captured_at,liquidity"
-                         "&order=captured_at.asc")
+                         "&order=captured_at.asc,mint.asc")
             seen_board = set(first)
             for r in uni:
                 m = r.get("mint")

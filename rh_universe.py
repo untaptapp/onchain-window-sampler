@@ -369,7 +369,7 @@ def audit():
     """
     import collections
     snaps = C.sb_all("/trending_snapshots?source=eq.gmgn_rh&select=mint,captured_at,extra"
-                     "&order=captured_at.asc")
+                     "&order=captured_at.asc,mint.asc")
     first = {}
     for r in snaps:
         first.setdefault(r["mint"].lower(), r)

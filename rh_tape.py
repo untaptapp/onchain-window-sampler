@@ -95,13 +95,12 @@ FLUSH_EVERY = int(os.environ.get("FLUSH_EVERY", "20"))
 # per-token cost and therefore into how long the 4,872-task LEAD backfill takes -- and the front-run
 # question the leads answer is worth more right now than a wider buyer sample. Raise it once the
 # lead backlog is drained.
-# DEFAULT 0 -- OFF. This probe has now had three rounds of cost pathology (unbounded scan from
-# block 0; then a bounded window that still bisected into hundreds of calls; one token spent 611
-# calls and 28 minutes in it) and it blocked the ESSENTIAL work -- the 5,898-task lead backfill that
-# answers the front-run question -- for five hours while every dashboard stayed green. An optional
-# feature sharing a pass budget spends the essential feature's money. It stays off until a clean
-# WORST-CASE measurement exists; set WALLET_PROBE_K=3 to re-enable.
-WALLET_PROBE_K = int(os.environ.get("WALLET_PROBE_K", "0"))     # 0 disables the probe entirely
+# Re-enabled after a WORST-CASE measurement, which is what was missing for three rounds. Re-ran the
+# exact task that had cost 611 calls and 28 minutes: it now takes 16 calls and 22.6s, and a whole
+# 6-task pass went 624 calls/1793s -> 42 calls/61s. The fix that did it is calling C.rpc directly
+# instead of C.get_logs, so a timeout is an answer ("unknown") rather than a trigger for bisection.
+# Set WALLET_PROBE_K=0 to disable if it ever starves the lead backfill again.
+WALLET_PROBE_K = int(os.environ.get("WALLET_PROBE_K", "3"))     # 0 disables the probe entirely
 WALLET_LOOKBACK_BLOCKS = int(os.environ.get("WALLET_LOOKBACK_BLOCKS", "900000"))  # ~1 day
 # Controls are matched to cases on BIRTH TIME as well as age; this is the half-width of the birth
 # bracket a candidate control must fall inside. Launch supply is ~21k/day (~15/min), so +/-30 min

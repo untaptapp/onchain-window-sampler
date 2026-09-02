@@ -51,6 +51,10 @@ LEADS = [int(x) for x in os.environ.get("LEADS", "60,120,300").split(",") if x.s
 # A lead row still needs a window to measure. Stepping back to within a few seconds of birth leaves
 # nothing but the mint Transfer, which is not an observation about trading.
 MIN_LEAD_EXPOSURE_S = int(os.environ.get("MIN_LEAD_EXPOSURE_S", "60"))
+# Share of the per-pass CASE budget reserved for lead rows. Board-entry rows cannot be starved
+# either -- they are the anchor every lead is measured relative to -- so this is a split, not a
+# priority.
+LEAD_FRAC = float(os.environ.get("LEAD_FRAC", "0.5"))
 # Controls are matched to cases on BIRTH TIME as well as age; this is the half-width of the birth
 # bracket a candidate control must fall inside. Launch supply is ~21k/day (~15/min), so +/-30 min
 # offers ~900 candidates per case — deep enough that matching almost never fails.
@@ -338,12 +342,22 @@ def build_queue():
     leads = [x for x in leads if not (x[:2] in seen_l or seen_l.add(x[:2]))]
     leads.sort(key=lambda x: -x[1])
     _lead_supply[:] = [len(leads), len(cases)]
-    # Board-entry rows first (they are the anchor every lead row is relative to), then leads fill
-    # whatever budget is left. Case supply is nearly exhausted -- 3,855 of 4,087 board mints already
-    # measured -- so without leads the collector idles with capacity to spare.
+    # RESERVE a share of the case budget for leads instead of ordering entries first.
+    #
+    # "Entries first, leads with the leftovers" starved the leads completely: the entry backlog sits
+    # at ~239 against n_case=240, so leads got ONE slot per pass, and the backlog does not drain
+    # because new board mints arrive about as fast as the collector measures them (56 rows/hour
+    # measured). An unbounded-priority queue starving the other class of work is exactly C0h, and it
+    # is invisible from outside -- the workflow is green, rows are being written, and the new data
+    # type simply never appears. Each class gets a floor; whichever is short donates to the other.
     n_ctrl = int(MAX_TOKENS * CONTROL_FRAC)
     n_case = MAX_TOKENS - n_ctrl
-    cases = (cases + leads)[:n_case]
+    n_lead = int(n_case * LEAD_FRAC)
+    n_entry = n_case - n_lead
+    take_e = cases[:n_entry]
+    take_l = leads[:n_lead + (n_entry - len(take_e))]          # unused entry slots go to leads
+    take_e = cases[:n_case - len(take_l)]                      # and unused lead slots come back
+    cases = take_e + take_l
     controls = []
     unmatched = 0
     if n_ctrl > 0 and cases:

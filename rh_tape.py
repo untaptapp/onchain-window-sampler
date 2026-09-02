@@ -63,6 +63,22 @@ MIN_LEAD_EXPOSURE_S = int(os.environ.get("MIN_LEAD_EXPOSURE_S", "60"))
 # either -- they are the anchor every lead is measured relative to -- so this is a split, not a
 # priority.
 LEAD_FRAC = float(os.environ.get("LEAD_FRAC", "0.5"))
+# WALLET EXPERIENCE — "new to the CHAIN", not "new to this token".
+#
+# `new_wallet_rate` is degenerate by construction: it asks whether a buyer held THIS token before,
+# and at launch nobody did, so it pins at 1.000 on 85% of cases. The discriminating question is
+# whether the buyer is a freshly created wallet, which is the sybil-ladder fingerprint (S24).
+#
+# The obvious implementation -- eth_getTransactionCount(wallet, block_at_as_of) -- is IMPOSSIBLE
+# here: this RPC is not an archive node. Measured 2026-09-02, state resolves ~1,000 blocks back
+# (~100 s) and anything deeper returns {'code': -32000, 'message': 'metadata is not found'}. Nonce
+# at 'latest' is not a substitute: a wallet that transacted 500 times AFTER the event would read as
+# experienced at the moment it bought, which is a post-entry observable (D-POSTOBS).
+#
+# LOGS are permanent, so ask the log index instead: did this wallet receive any ERC-20 transfer
+# before the window opened? Two tiers, because most wallets resolve on the first.
+WALLET_PROBE_K = int(os.environ.get("WALLET_PROBE_K", "6"))     # 0 disables the probe entirely
+WALLET_RECENT_BLOCKS = int(os.environ.get("WALLET_RECENT_BLOCKS", "900000"))   # ~1 day
 # Controls are matched to cases on BIRTH TIME as well as age; this is the half-width of the birth
 # bracket a candidate control must fall inside. Launch supply is ~21k/day (~15/min), so +/-30 min
 # offers ~900 candidates per case — deep enough that matching almost never fails.
@@ -181,6 +197,29 @@ def features(mint, as_of, window_s, tr, truncated, creator, pool, pool_share, pr
     }
 
 
+def wallet_prior(w, b_lo):
+    """Did wallet `w` receive any ERC-20 transfer strictly BEFORE block b_lo?
+
+    True/False, or None when we could not find out — never a default. "No prior activity" is the
+    interesting case (a wallet created to buy this launch), so defaulting an unanswerable query to
+    either value would manufacture the very signal being tested (F5).
+    """
+    if b_lo <= 0 or WALLET_PROBE_K <= 0:
+        return None
+    topic = "0x" + "00" * 12 + w[2:]
+    try:
+        lo1 = max(0, b_lo - WALLET_RECENT_BLOCKS)
+        if lo1 < b_lo and C.get_logs({"topics": [C.TRANSFER, None, topic],
+                                      "fromBlock": hex(lo1), "toBlock": hex(b_lo - 1)}):
+            return True
+        if lo1 == 0:
+            return False
+        return bool(C.get_logs({"topics": [C.TRANSFER, None, topic],
+                                "fromBlock": hex(0), "toBlock": hex(lo1 - 1)}))
+    except Exception:
+        return None
+
+
 def measure(mint, as_of, window_s, creator=None, born_block=None, born_ts=None):
     """One token, its life up to `as_of`, capped at `window_s`.
 
@@ -260,6 +299,18 @@ def measure(mint, as_of, window_s, creator=None, born_block=None, born_ts=None):
         row["exposure_s"] = None
     if not prior_ok:
         row["new_wallet_rate"] = None
+    # Probe the largest buyers by volume. Sampling the top K keeps the cost bounded;
+    # `buyer_probe_n` records how many actually answered, so a partial probe can never be read as
+    # a whole-cohort measurement.
+    probed = []
+    for w in (row.get("top_buyers") or [])[:WALLET_PROBE_K]:
+        if C.calls() >= MAX_CALLS:
+            break
+        v = wallet_prior(w, b_lo)
+        if v is not None:
+            probed.append(v)
+    row["buyer_probe_n"] = len(probed)
+    row["buyer_prior_rate"] = (sum(probed) / len(probed)) if probed else None
     return row
 
 

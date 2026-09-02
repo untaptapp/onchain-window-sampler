@@ -33,6 +33,15 @@ create table if not exists rh_launches (
   created_at    bigint not null,          -- unix seconds, derived from block number x block time
   block_number  bigint not null,
   launchpad     text,                     -- our label for the factory that emitted the event
+  -- How created_at was derived, and therefore whether it may be used as a BIRTH.
+  --   'launchpad' -> a token-creation event fired: created_at IS the birth.
+  --   'pool'      -> a pair/pool-creation event on a shared AMM: created_at is only an UPPER BOUND.
+  -- Measured 2026-09-02: 71.7% of amm_shared board mints were sighted BEFORE their recorded
+  -- "birth", median 14.4h before. Computing a token age from a pool birth yields negative ages,
+  -- and clamping a measurement window to one inverts the block range -- which eth_getLogs answers
+  -- with an empty list, fabricating a "silent token". Writers must never let a pool row overwrite
+  -- a launchpad row for the same mint (rh_universe writes pool rows ignore-duplicates).
+  birth_kind    text,
   factory       text not null,            -- the contract whose log we matched
   topic0        text not null,            -- the creation event signature we matched
   creator       text,                     -- tx.from of the creating transaction, when resolved

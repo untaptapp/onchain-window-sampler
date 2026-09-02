@@ -275,6 +275,12 @@ def scan(lo, hi, budget, quotes):
                 bn = int(lg["blockNumber"], 16)
                 out[mint] = {"mint": mint, "created_at": C.blk_to_ts(bn), "block_number": bn,
                              "launchpad": lp, "factory": fac, "topic0": topic,
+                             # A `pair` entry watches POOL creation, which can be many hours after
+                             # the token was minted — measured, 71.7% of amm_shared board mints were
+                             # on the board BEFORE their recorded "birth", median 14.4h before. So
+                             # created_at from a pair event is an UPPER BOUND, not a birth, and any
+                             # age computed from it is wrong. Record which kind it is.
+                             "birth_kind": "pool" if how == "pair" else "launchpad",
                              "creator": None, "tx_hash": lg.get("transactionHash"),
                              "symbol": decode_symbol(lg.get("data") or "0x"),
                              "first_seen_at": int(time.time())}
@@ -320,7 +326,16 @@ def one_pass(quotes):
     # population at risk) behind an OPTIONAL enrichment: measured 2026-09-01, rh_launches sat
     # unchanged for 51 minutes while the collector looked busy and healthy. `creator` is a
     # nice-to-have for the fee-farming question; a missing launch row is a hole in the control arm.
-    wrote = C.sb_write("/rh_launches?on_conflict=mint", rows)
+    # A pool-creation row must never OVERWRITE a launchpad row for the same mint. Both events fire
+    # for the same token, typically hours apart and therefore in different passes, so with plain
+    # merge-duplicates the later pool event would replace a correct birth with a much later one.
+    # Launchpad rows merge (they are authoritative and creator enrichment must be able to update
+    # them); pool rows only ever fill a gap.
+    lp_rows = [r for r in rows if r["birth_kind"] == "launchpad"]
+    pool_rows = [r for r in rows if r["birth_kind"] == "pool"]
+    wrote = C.sb_write("/rh_launches?on_conflict=mint", lp_rows)
+    wrote += C.sb_write("/rh_launches?on_conflict=mint", pool_rows,
+                        prefer="resolution=ignore-duplicates,return=minimal")
     # Only advance the bookmark over the range actually scanned, and only AFTER the write lands —
     # C3: an interrupted pass must be re-doable, never silently skipped.
     if reached >= mark:
@@ -329,6 +344,9 @@ def one_pass(quotes):
     # recoverable on any later pass; a launch missed is not recoverable until the next scan.
     got = fill_creators(rows, CREATOR_CALLS)
     if got:
+        # Only launchpad rows are re-sent with merge: re-merging a pool row here would undo the
+        # protection above and clobber the authoritative birth.
+        rows = lp_rows
         # Re-send the FULL rows, not {mint, creator}. PostgREST's merge-duplicates still attempts
         # the INSERT, and NOT NULL on created_at/block_number/factory/topic0/first_seen_at is
         # checked before conflict resolution — a partial payload would 400 the whole batch.

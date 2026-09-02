@@ -138,6 +138,32 @@ def get_logs(params, depth=0):
 
 _anchor = None
 
+# Known-exact (block, timestamp) points, kept sorted. A SINGLE linear anchor taken at the head is
+# not accurate enough to do age arithmetic with: measured 2026-09-02 against real block timestamps,
+# the one-anchor estimate was +0.95 min off at 100k blocks back, +9.6 min at 1M, and **+29.9 min at
+# 3M** (~3.5 days) — always LATE, so launches were dated later than they happened. That is fine for
+# picking a scan range and fatal for "how old was this token when it was measured", which is the
+# covariate the case/control design turns on. So bracket every query between two REAL blocks and
+# interpolate, refining by bisection until the bracket is narrow enough that curvature cannot matter.
+_pts = []
+MAX_BRACKET = int(os.environ.get("TS_MAX_BRACKET", "50000"))
+
+
+def _real_ts(bn):
+    b = rpc("eth_getBlockByNumber", [hex(int(bn)), False])
+    if not b or "timestamp" not in b:
+        raise RpcError(f"no block {bn}")
+    return int(b["timestamp"], 16)
+
+
+def _remember(bn, ts):
+    import bisect
+    bn = int(bn)
+    i = bisect.bisect_left([p[0] for p in _pts], bn)
+    if i < len(_pts) and _pts[i][0] == bn:
+        return
+    _pts.insert(i, (bn, int(ts)))
+
 
 def block_time():
     """Anchor seconds-per-block on two REAL blocks. Robinhood Chain runs ~0.1005 s/block, but
@@ -146,8 +172,10 @@ def block_time():
     if _anchor is None:
         latest = int(rpc("eth_blockNumber", []), 16)
         span = min(20_000_000, latest)
-        t_new = int(rpc("eth_getBlockByNumber", [hex(latest), False])["timestamp"], 16)
-        t_old = int(rpc("eth_getBlockByNumber", [hex(latest - span), False])["timestamp"], 16)
+        t_new = _real_ts(latest)
+        t_old = _real_ts(latest - span)
+        _remember(latest, t_new)
+        _remember(latest - span, t_old)
         _anchor = (latest, t_new, (t_new - t_old) / span)
     return _anchor
 
@@ -161,13 +189,71 @@ def refresh_head():
 
 
 def blk_to_ts(bn):
-    latest, t_new, bt = block_time()
-    return int(t_new - (latest - bn) * bt)
+    """Timestamp of a block, interpolated between two REAL bracketing blocks.
+
+    Costs at most a few eth_getBlockByNumber calls the first time a region is touched, then nothing
+    — the points are cached for the life of the process and every later query in the same region
+    reuses them. Falls back to the linear head anchor only when the chain cannot be reached, and
+    that fallback is the old (drifting) behaviour, so it is never silently better than it is.
+    """
+    import bisect
+    bn = int(bn)
+    block_time()
+    ks = [p[0] for p in _pts]
+    if bn <= ks[0]:
+        lo_i = 0
+    elif bn >= ks[-1]:
+        latest, t_new, bt = _anchor
+        return int(t_new + (bn - latest) * bt)          # beyond head: extrapolate, tiny distance
+    else:
+        lo_i = bisect.bisect_right(ks, bn) - 1
+    # Narrow the bracket by bisection until it is small enough for linear interpolation.
+    for _ in range(40):
+        ks = [p[0] for p in _pts]
+        i = bisect.bisect_right(ks, bn) - 1
+        i = max(0, min(i, len(_pts) - 2))
+        b0, t0 = _pts[i]
+        b1, t1 = _pts[i + 1]
+        if b1 - b0 <= MAX_BRACKET or b1 - b0 <= 1:
+            break
+        mid = (b0 + b1) // 2
+        try:
+            _remember(mid, _real_ts(mid))
+        except Exception:
+            break                                        # cannot refine: interpolate what we have
+    if b1 == b0:
+        return int(t0)
+    return int(t0 + (t1 - t0) * (bn - b0) / (b1 - b0))
 
 
 def ts_to_blk(ts):
-    latest, t_new, bt = block_time()
-    return int(latest - (t_new - ts) / bt)
+    """Inverse of blk_to_ts, over the same interpolation points."""
+    import bisect
+    block_time()
+    ts = int(ts)
+    tss = [p[1] for p in _pts]
+    if ts >= tss[-1] or len(_pts) < 2:
+        latest, t_new, bt = _anchor
+        return int(latest - (t_new - ts) / bt)
+    if ts <= tss[0]:
+        b0, t0 = _pts[0]
+        b1, t1 = _pts[1]
+        return int(b0 - (t0 - ts) * (b1 - b0) / max(t1 - t0, 1))
+    for _ in range(40):
+        tss = [p[1] for p in _pts]
+        i = max(0, min(bisect.bisect_right(tss, ts) - 1, len(_pts) - 2))
+        b0, t0 = _pts[i]
+        b1, t1 = _pts[i + 1]
+        if b1 - b0 <= MAX_BRACKET or b1 - b0 <= 1:
+            break
+        mid = (b0 + b1) // 2
+        try:
+            _remember(mid, _real_ts(mid))
+        except Exception:
+            break
+    if t1 == t0:
+        return int(b0)
+    return int(b0 + (b1 - b0) * (ts - t0) / (t1 - t0))
 
 
 def topic_addr(topic):

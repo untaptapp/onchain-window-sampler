@@ -60,6 +60,18 @@ create table if not exists rh_tape (
   -- flow
   net_buy_ratio     double precision,     -- buy_count / (buy_count + sell_count)
   vol_tokens        double precision,     -- total tokens moved (raw units, no decimals applied)
+  -- Token age at as_of, and how much of the window the token actually existed for. age_s is THE
+  -- confounder in this design: cases were historically measured at age ~0 and controls at ~27h,
+  -- with NO overlapping age band, which made every case/control contrast a measure of the sampling
+  -- rule rather than of the token. Never compare arms without conditioning on age_s, and never
+  -- compare COUNT features (n_logs, buy_count, n_buyers) across rows without normalising by
+  -- exposure_s. NULL means the birth is unknown or untrustworthy, never that the age is zero.
+  age_s             bigint,
+  exposure_s        bigint,
+  -- Up to TOP_BUYERS_K buyer addresses by volume, largest first. Every other column in this table
+  -- is a WITHIN-token aggregate, so no query over them can express "the same cohort bought the last
+  -- 40 launches" -- which is where sybil/farm structure actually lives. Burn sinks are excluded.
+  top_buyers        jsonb,
   computed_at       bigint not null,
   primary key (mint, as_of, window_s)
 );

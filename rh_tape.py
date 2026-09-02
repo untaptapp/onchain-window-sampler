@@ -296,9 +296,12 @@ def build_queue():
     unmatched = 0
     if n_ctrl > 0 and cases:
         import bisect
-        launches = C.sb_all("/rh_launches?select=mint,created_at")
-        pool_ = sorted(((int(r["created_at"]), r["mint"].lower()) for r in launches
-                        if r["mint"].lower() not in first), key=lambda x: x[0])
+        # Draw controls from BORN_TS, which load_launch_meta already restricted to LAUNCHPAD births.
+        # Reading rh_launches again here would re-admit pool-derived rows, whose created_at is only
+        # an upper bound: the control would be matched on a fake birth and then refused a date by
+        # measure(), which is how 87% of the first live batch came back with a NULL age. One source
+        # of truth for "when was this token born", used by both the match and the measurement.
+        pool_ = sorted(((b, m) for m, b in BORN_TS.items() if m not in first), key=lambda x: x[0])
         births = [p[0] for p in pool_]
         used = set()
         for m, t, _arm in cases:

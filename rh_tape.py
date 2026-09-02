@@ -77,8 +77,19 @@ LEAD_FRAC = float(os.environ.get("LEAD_FRAC", "0.5"))
 #
 # LOGS are permanent, so ask the log index instead: did this wallet receive any ERC-20 transfer
 # before the window opened? Two tiers, because most wallets resolve on the first.
-WALLET_PROBE_K = int(os.environ.get("WALLET_PROBE_K", "6"))     # 0 disables the probe entirely
-WALLET_RECENT_BLOCKS = int(os.environ.get("WALLET_RECENT_BLOCKS", "900000"))   # ~1 day
+# The lookback is BOUNDED and the feature is defined by it: "did this wallet receive an ERC-20
+# transfer in the LOOKBACK before the window opened". The first version fell back to scanning from
+# block 0 whenever the recent slice was empty -- which is precisely the case we care about, a wallet
+# with no recent activity -- and that scan is unbounded: it times out on the node and get_logs
+# bisects, so one probe could run for minutes. Deployed, it wrote ZERO rows in 70 minutes and
+# starved the lead backfill, with a green workflow throughout. A bounded window answers the same
+# question at fixed cost; a wallet with nothing in 7 days before buying is the signal either way.
+# K=3, not 6. Each probe costs ~2.8s / 2.8 calls even bounded, so K multiplies directly into the
+# per-token cost and therefore into how long the 4,872-task LEAD backfill takes -- and the front-run
+# question the leads answer is worth more right now than a wider buyer sample. Raise it once the
+# lead backlog is drained.
+WALLET_PROBE_K = int(os.environ.get("WALLET_PROBE_K", "3"))     # 0 disables the probe entirely
+WALLET_LOOKBACK_BLOCKS = int(os.environ.get("WALLET_LOOKBACK_BLOCKS", "6000000"))   # ~7 days
 # Controls are matched to cases on BIRTH TIME as well as age; this is the half-width of the birth
 # bracket a candidate control must fall inside. Launch supply is ~21k/day (~15/min), so +/-30 min
 # offers ~900 candidates per case — deep enough that matching almost never fails.
@@ -207,15 +218,12 @@ def wallet_prior(w, b_lo):
     if b_lo <= 0 or WALLET_PROBE_K <= 0:
         return None
     topic = "0x" + "00" * 12 + w[2:]
+    lo = max(0, b_lo - WALLET_LOOKBACK_BLOCKS)
+    if lo >= b_lo:
+        return None
     try:
-        lo1 = max(0, b_lo - WALLET_RECENT_BLOCKS)
-        if lo1 < b_lo and C.get_logs({"topics": [C.TRANSFER, None, topic],
-                                      "fromBlock": hex(lo1), "toBlock": hex(b_lo - 1)}):
-            return True
-        if lo1 == 0:
-            return False
         return bool(C.get_logs({"topics": [C.TRANSFER, None, topic],
-                                "fromBlock": hex(0), "toBlock": hex(lo1 - 1)}))
+                                "fromBlock": hex(lo), "toBlock": hex(b_lo - 1)}))
     except Exception:
         return None
 

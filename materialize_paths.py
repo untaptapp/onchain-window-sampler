@@ -44,8 +44,18 @@ HORIZONS = [("ret_15m", 15), ("ret_30m", 30), ("ret_1h", 60), ("ret_2h", 120),
             ("ret_3h", 180), ("ret_6h", 360), ("ret_12h", 720)]
 
 
-def shape(bars, solat, t0):
-    """MFE/MAE and static-horizon returns, all SOL-denominated."""
+def shape(bars, solat, t0, mark=None):
+    """MFE/MAE and static-horizon returns, all SOL-denominated.
+
+    `mark` is how far collection has actually got for THIS mint (trending_pools.last_fetch_to,
+    falling back to the corpus high-water). A horizon counts as reached when the CORPUS has passed
+    it -- NOT when this token's own bars do. The latter drops every token that stopped trading
+    before the horizon, and a token stops trading mostly because it died, so that population is
+    selected on the outcome: only 62.2% of Solana paths had a ret_3h and 37.8% had span_min < 180.
+    A token that stopped trading exits at its last traded price, which is a real outcome -- and an
+    optimistic one, since you would in fact be stuck in something with no bid. Only an UNFINISHED
+    horizon is NULL. materialize_rh.sql has always done it this way; Solana did not, which made the
+    two chains' returns non-comparable as well as biased."""
     p0 = bars[0][4]
     if not p0 or p0 <= 0:
         return {}
@@ -61,12 +71,16 @@ def shape(bars, solat, t0):
     out["mfe_min"] = int((hi_t - t0) / 60) if hi_t else 0
     out["mae_pct"] = sol(lo / p0 - 1, lo_t or t0)
     out["mae_min"] = int((lo_t - t0) / 60) if lo_t else 0
+    reached = mark if mark is not None else (bars[-1][0] if bars else None)
     for name, mins in HORIZONS:
         cut = t0 + mins * 60
         seg = [b for b in bars if b[0] <= cut]
-        # Only report a horizon the bars actually reach — otherwise this silently becomes
-        # "the last price we happen to have", which is the censoring bug in a new costume.
-        out[name] = sol(seg[-1][4] / p0 - 1, seg[-1][0]) if (len(seg) > 1 and bars[-1][0] >= cut) else None
+        # Report the horizon when COLLECTION has passed it, marking a token that went quiet at its
+        # last traded price. Gating on this token's own last bar instead is what selected the
+        # population on the outcome; gating on nothing at all would be the censoring bug, which is
+        # why `reached` still has to clear the cut.
+        out[name] = (sol(seg[-1][4] / p0 - 1, seg[-1][0])
+                     if (len(seg) > 1 and reached is not None and reached >= cut) else None)
     return out
 
 
@@ -83,7 +97,7 @@ def main():
              "n_bars": len(e["bars"]), "last_bar_ts": int(e["bars"][-1][0]),
              "span_min": int((e["bars"][-1][0] - e["t0"]) / 60),
              "horizon_h": B.HORIZON_H, "liq_entry": e.get("liq")}
-        r.update(shape(e["bars"], solat, e["t0"]))
+        r.update(shape(e["bars"], solat, e["t0"], e.get("fetched_to") or B._HW))
         # Traded volume across the FULL horizon, stored so a screen can apply its own
         # size-appropriate participation limit without re-materialising. The floor applied inside
         # pit_net_return is deliberately conservative (non-markets only); this column is the raw

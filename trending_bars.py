@@ -804,8 +804,13 @@ def main():
                 # flush pools on the SAME cadence — writing them only at end-of-pass meant an
                 # interrupted run lost every resolution and re-paid for it on the next pass
                 flush_pools(new_pools, new_attempts); flush_cov(new_cov)
+                # The never-landed counters ride on the FLUSH line, not only the pass summary:
+                # a pass is 5h and is often cancelled before it ends, so an end-of-pass-only
+                # diagnostic is one that nobody ever reads. This is the number that says whether
+                # the rate limit is silently eating mints again.
                 print(f"  .. {done} mints, {len(new_bars)} bars + {len(new_pools)} pools flushed, "
-                      f"{calls['n']} calls", flush=True)
+                      f"{calls['n']} calls ({calls['no_answer']} never landed, "
+                      f"{n_unlanded} mints deferred)", flush=True)
                 new_bars, new_pools, new_attempts, new_cov = [], [], [], []
         flush_pools(new_pools, new_attempts); flush_cov(new_cov)
         for i in range(0, len(new_bars), 500):

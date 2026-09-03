@@ -73,10 +73,22 @@ def one_pass():
     """Pull trending pools; dedupe to one row per mint; append to trending_snapshots."""
     cap = int(time.time() * 1000)          # GeckoTerminal has no board timestamp — use poll time
     polled = int(time.time())
-    seen = set(); rows = []; rank = 0
+    # RANK IS POSITIONAL, SO A SKIPPED PAGE CORRUPTS EVERY RANK AFTER IT.
+    # `rank` only increments on pages that came back, so skipping a failed page 2 and carrying on
+    # gave page 3's tokens ranks 21-40 instead of 41-60 — and the snapshot was written anyway,
+    # indistinguishable from a board that was genuinely that short. Ranks from a CONTIGUOUS PREFIX
+    # of pages are correct; ranks after a hole are unknowable, because we cannot know how many rows
+    # the missing page held. So stop at the first failure and record the depth actually collected.
+    seen = set(); rows = []; rank = 0; pages_ok = 0; truncated = False
     for pg in range(1, GT_PAGES + 1):
         d = gt(f"/networks/solana/trending_pools?page={pg}")
+        if not d:
+            truncated = True
+            print(f"  page {pg} did not land — board truncated at {rank} ranks "
+                  f"(writing the good prefix, not a mis-ranked board)", flush=True)
+            break
         if d:
+            pages_ok += 1
             for p in d.get("data", []):
                 a = p.get("attributes", {})
                 base = p.get("relationships", {}).get("base_token", {}).get("data", {}).get("id", "")
@@ -94,15 +106,22 @@ def one_pass():
                     "liquidity": _f(a.get("reserve_in_usd")),
                     "extra": {"pool": a.get("address"), "created": a.get("pool_created_at"),
                               "vol": vol, "txns": a.get("transactions"),
-                              "pchg": a.get("price_change_percentage")},
+                              "pchg": a.get("price_change_percentage"),
+                              # board depth this snapshot actually saw, so a consumer can tell a
+                              # short board from a truncated read instead of guessing
+                              "pages_ok": None, "board_truncated": None},
                 })
         time.sleep(2.2)
     if not rows:
         print("no pools", flush=True); return 0
+    for r in rows:                       # known only once the page loop has finished
+        r["extra"]["pages_ok"] = pages_ok
+        r["extra"]["board_truncated"] = truncated
     st, _ = sb("POST", "/trending_snapshots?on_conflict=mint,captured_at,source",
                rows, prefer="resolution=merge-duplicates,return=minimal")
     ok = st in (200, 201, 204)
-    print(f"pass cap={cap} rows={len(rows)} write={st}{'' if ok else ' FAIL'}", flush=True)
+    print(f"pass cap={cap} rows={len(rows)} pages={pages_ok}/{GT_PAGES}"
+          f"{' TRUNCATED' if truncated else ''} write={st}{'' if ok else ' FAIL'}", flush=True)
     return len(rows) if ok else 0
 
 

@@ -35,11 +35,17 @@ begin
                  where tb.mint=j.mint and tb.ts>=j.t0 and tb.ts<=j.t0+entry_tol_s
                  order by tb.ts limit 1) en on true
               where en.o is not null and en.o>0),
-       w  as (select e.*, tb.ts, tb.c, tb.h, tb.l from e
+       w  as (select e.*, tb.ts, tb.c, tb.h, tb.l, tb.vol from e
               join trending_bars tb on tb.mint=e.mint and tb.ts>=e.t0 and tb.ts<=e.t0+43200),
        g  as (
          select mint, t0, born, p_entry, tmax,
                 count(*) n_bars, max(ts) last_bar_ts,
+                -- USD traded across the 3h horizon these returns are quoted at. A screen must
+                -- apply its own participation limit against this: a "return" printed on a window
+                -- that traded a few dollars is a quote artifact, not a result. On Solana one such
+                -- path returned +274,808,400% off $0.41 of volume. RH carries no cost-netted
+                -- column to zero, so here the fact is simply recorded rather than acted on.
+                coalesce(sum(vol) filter (where ts<=t0+10800),0) win_vol,
                 (array_agg(ts order by h desc))[1] hi_ts, max(h) hi_p,
                 (array_agg(ts order by l asc))[1]  lo_ts, min(l) lo_p,
                 (array_agg(c order by ts desc) filter (where ts<=t0+900))[1]   c15m,
@@ -52,7 +58,7 @@ begin
          from w group by mint, t0, born, p_entry, tmax)
   insert into trending_paths (source, mint, entry_ts, entry_price, age_s, n_bars, last_bar_ts,
         span_min, horizon_h, mfe_pct, mfe_min, mae_pct, mae_min,
-        ret_15m, ret_30m, ret_1h, ret_2h, ret_3h, ret_6h, ret_12h, computed_at)
+        ret_15m, ret_30m, ret_1h, ret_2h, ret_3h, ret_6h, ret_12h, win_vol, computed_at)
   select 'gmgn_rh', mint, t0::bigint, p_entry,
          case when born is not null then t0-born end,
          n_bars, last_bar_ts, ((last_bar_ts-t0)/60)::int, 3.0,
@@ -65,6 +71,7 @@ begin
          case when tmax>=t0+10800 and c3h  is not null then c3h /p_entry-1 end,
          case when tmax>=t0+21600 and c6h  is not null then c6h /p_entry-1 end,
          case when tmax>=t0+43200 and c12h is not null then c12h/p_entry-1 end,
+         win_vol,
          now()
   from g
   on conflict (source, mint) do update set
@@ -74,7 +81,7 @@ begin
     mae_pct=excluded.mae_pct, mae_min=excluded.mae_min,
     ret_15m=excluded.ret_15m, ret_30m=excluded.ret_30m, ret_1h=excluded.ret_1h,
     ret_2h=excluded.ret_2h, ret_3h=excluded.ret_3h, ret_6h=excluded.ret_6h,
-    ret_12h=excluded.ret_12h, computed_at=excluded.computed_at;
+    ret_12h=excluded.ret_12h, win_vol=excluded.win_vol, computed_at=excluded.computed_at;
   get diagnostics n = row_count;
   return n;
 end $function$;

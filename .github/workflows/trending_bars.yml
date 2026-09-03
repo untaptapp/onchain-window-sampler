@@ -50,6 +50,18 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          # PRUNE=0 since 2026-09-03. prune_trending_bars deletes a MEASURED ZERO rows -- both
+          # halves: the window delete is structurally empty because the collector and the pruner
+          # agree on [lo-pre_h, hi+ph] (C0c), and the orphan delete is empty because every mint
+          # with bars is in one of the four population tables. It nonetheless scans 2.4M rows for
+          # >60s and dies on Supabase's GATEWAY timeout -- 60s, independent of the 120s
+          # statement_timeout, so raising that would not have helped -- which sb() then retried
+          # four times, spending ~4 min of every pass and printing "pruned FAILED(0)" forever. A
+          # permanently-red line in a healthy log is worse than no line: it teaches you to skip it.
+          # Storage does not bind: 1.34 GB of 8 GB, ~55 MB/day, ~120 days of runway. If it ever
+          # does, the deliberate lever is KEEP_DAYS in materialize-paths (see C0d) -- and this
+          # function needs chunking before it can run through PostgREST at all.
+          PRUNE: '0'
           MAX_CALLS: '2400'
           RUN_SECONDS: '18000'
           SLEEP: '2.1'

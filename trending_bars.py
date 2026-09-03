@@ -199,12 +199,26 @@ def sb_all(path, page=1000, cap=600000):
     return out
 
 
-calls = {"n": 0}
+calls = {"n": 0, "no_answer": 0}
+
+# A REQUEST THAT NEVER LANDED IS NOT EVIDENCE ABOUT THE WORLD.
+# gt() used to return None both when GeckoTerminal answered "this pool has no bars" and when all
+# three attempts were rate-limited out — and every caller then recorded that as an observation:
+# fetch_bars returned [] and the fetch loop stamped `last_fetch_to` anyway, so the mint's deficit
+# "collapsed" and it dropped out of the priority queue having never been served; resolve_pool
+# cached ok=False, a permanent "this token has no pool" verdict caused by our own throttling.
+# Measured 2026-09-03: GeckoTerminal's keyless limit is ~5-6 successful req/min. At SLEEP=2.1 the
+# collector 429s on roughly half its attempts, so ~1 call in 6 exhausted the ladder, burned 36s,
+# and returned that false negative. NO_ANSWER makes the two cases distinguishable; every caller
+# must skip rather than record.
+NO_ANSWER = object()
 
 
 def gt(url):
+    """Parsed JSON; None when GT answered but had nothing; NO_ANSWER when the request never
+    landed (rate-limited or network). NO_ANSWER must never be written down as an observation."""
     if calls["n"] >= MAX_CALLS:
-        return None
+        return NO_ANSWER
     calls["n"] += 1
     for a in range(3):
         try:
@@ -219,11 +233,14 @@ def gt(url):
             return None
         except Exception:
             time.sleep(2)
-    return None
+    calls["no_answer"] += 1
+    return NO_ANSWER
 
 
 def resolve_pool(mint):
     j = gt(f"{GT}/tokens/{mint}/pools")
+    if j is NO_ANSWER:
+        return None                       # never landed — leave the mint unresolved, retry later
     if not j or not j.get("data"):
         return {"mint": mint, "ok": False, "resolved_at": int(time.time()),
                 "pool_address": None, "dex": None, "reserve_usd": None, "n_pools": 0}
@@ -252,8 +269,8 @@ def resolve_pools_batch(mints):
         return {"mint": m, "ok": False, "resolved_at": now_i, "pool_address": None,
                 "dex": None, "reserve_usd": None, "n_pools": 0, "last_fetch_to": None}
     j = gt(f"{GT}/tokens/multi/{','.join(mints)}?include=top_pools")
-    if not j:
-        return {}                                   # budget exhausted or API down — retry next pass
+    if j is NO_ANSWER or not j:
+        return {}                                   # never landed — resolve nothing, retry next pass
     by_id = {}
     for o in (j.get("included") or []):
         if o.get("type") != "pool":
@@ -288,13 +305,19 @@ def resolve_pools_batch(mints):
 
 
 def fetch_bars(pool, need_from, need_to):
-    """Minute bars covering [need_from, need_to], paging backwards until we reach need_from."""
-    got, before = {}, None
+    """Minute bars covering [need_from, need_to], paging backwards until we reach need_from.
+
+    Returns (bars, landed). `landed` is False when a page never came back — the caller must NOT
+    then stamp last_fetch_to, or our own rate limit is recorded as this token's silence."""
+    got, before, landed = {}, None, True
     for _ in range(4):
         u = f"{GT}/pools/{pool}/ohlcv/minute?aggregate=1&limit=1000"
         if before:
             u += f"&before_timestamp={before}"
         j = gt(u)
+        if j is NO_ANSWER:
+            landed = False
+            break
         if not j:
             break
         lst = ((j.get("data") or {}).get("attributes") or {}).get("ohlcv_list") or []
@@ -307,7 +330,7 @@ def fetch_bars(pool, need_from, need_to):
         if oldest <= need_from or calls["n"] >= MAX_CALLS:
             break
         before = oldest
-    return [got[k] for k in sorted(got)]
+    return [got[k] for k in sorted(got)], landed
 
 
 def main():
@@ -704,6 +727,7 @@ def main():
         # silent (the pools write ignores its status), and it took the newly resolved pools down with
         # it, so every resolution was lost and re-paid for on the next pass.
         new_pools, new_attempts, new_bars, new_cov, done = [], [], [], [], 0
+        n_unlanded = 0
         for mint, t0 in todo:
             if calls["n"] >= MAX_CALLS:
                 break
@@ -720,6 +744,11 @@ def main():
             newly = False
             if p is None:
                 p = resolve_pool(mint)
+                if p is None:
+                    # The resolve never landed. Caching ok=False here would retire the mint on the
+                    # strength of our own rate limit; leave it unresolved and try again next pass.
+                    n_unlanded += 1
+                    continue
                 # Give every fresh resolution the same key set the fetch loop may later add, so the
                 # batch stays uniform whether or not this mint reaches the fetch. Safe to write NULL
                 # here precisely because this mint had no row: it cannot clobber an existing mark.
@@ -735,7 +764,7 @@ def main():
             # already covered (allow a 3-bar edge tolerance)
             if cov[0] is not None and cov[0] <= need_from + 180 and cov[1] >= need_to - 180:
                 continue
-            bars = fetch_bars(p["pool_address"], need_from, need_to)
+            bars, landed = fetch_bars(p["pool_address"], need_from, need_to)
             if bars:
                 # Keep trending_bar_cov current for this mint, merging with what we already had so
                 # a partial re-fetch never narrows the recorded window.
@@ -746,18 +775,28 @@ def main():
                               (covn or 0) + len(bars)]
                 new_cov.append({"mint": mint, "ts_from": have[mint][0], "ts_to": have[mint][1],
                                 "n_bars": have[mint][2]})
-            # Remember how far we asked, so a dead token's deficit collapses after ONE attempt
-            # instead of re-queuing at the head of the list on every pass.
-            # A pool resolved THIS iteration is already in new_pools by reference, so mutating it
-            # is enough — appending again would put the same mint twice in one upsert batch, which
-            # Postgres rejects ("ON CONFLICT DO UPDATE cannot affect row a second time").
-            p["last_fetch_to"] = int(need_to)
-            if not newly:
-                new_attempts.append({"mint": mint, "last_fetch_to": int(need_to)})
+            # Whatever DID come back is real and gets written — a partial page is still data, and
+            # new_cov above has already recorded it, so dropping the rows here would leave coverage
+            # claiming bars that no longer exist.
             for b in bars:
                 new_bars.append({"mint": mint, "ts": int(b[0]), "o": b[1], "h": b[2],
                                  "l": b[3], "c": b[4], "vol": b[5]})
             done += 1
+            # Remember how far we asked, so a dead token's deficit collapses after ONE attempt
+            # instead of re-queuing at the head of the list on every pass.
+            # ONLY when the request actually landed. GT answering "no bars in that window" is a
+            # fact about the token and retires it; a 429 ladder that ran out of attempts is a fact
+            # about US, and stamping it converted our own throttling into this token's recorded
+            # silence — the mint left the queue having never been served, and nothing said so.
+            # A pool resolved THIS iteration is already in new_pools by reference, so mutating it
+            # is enough — appending again would put the same mint twice in one upsert batch, which
+            # Postgres rejects ("ON CONFLICT DO UPDATE cannot affect row a second time").
+            if not landed:
+                n_unlanded += 1
+                continue
+            p["last_fetch_to"] = int(need_to)
+            if not newly:
+                new_attempts.append({"mint": mint, "last_fetch_to": int(need_to)})
             if len(new_bars) >= 2000:
                 for i in range(0, len(new_bars), 500):
                     sb("POST", "/trending_bars?on_conflict=mint,ts", new_bars[i:i + 500],
@@ -797,12 +836,15 @@ def main():
         # is first seen. The function stays deployed as a lever if storage ever binds again.
         st_u, uni = sb("POST", "/rpc/prune_candidate_universe", {}) if PRUNE else (200, 0)
         print(f"pass done: {done} mints filled, {len(new_pools)} pools resolved, "
-              f"{calls['n']} GT calls, pruned {pruned if st == 200 else f'FAILED({st})'} bars, "
+              f"{calls['n']} GT calls ({calls['no_answer']} never landed, "
+              f"{n_unlanded} mints deferred), "
+              f"pruned {pruned if st == 200 else f'FAILED({st})'} bars, "
               f"dropped {uni if st_u == 200 else f'FAILED({st_u})'} universe rows",
               flush=True)
         if not t_end or time.time() >= t_end:
             break
         calls["n"] = 0
+        calls["no_answer"] = 0
         time.sleep(30)
 
 

@@ -5,9 +5,19 @@ name: trending
 # ~5.5h (one board pull every PASS_INTERVAL seconds) and the cron is only a
 # restart heartbeat. concurrency keeps exactly one job running -> continuous
 # coverage regardless of how erratically the schedule fires.
+#
+# CRON DISABLED 2026-09-03 — the fomoscan pilot quota is exhausted (`unitsRemaining=0`), so every
+# run has printed "QUOTA EXHAUSTED at startup — exiting" and written nothing since 2026-08-27
+# (238 rows, the whole table). It exits 0, so the workflow list showed five green runs a day for a
+# feed that had been dead six days: exactly the "verify feeds are alive before trusting a label"
+# case, since board labels take the EARLIEST sighting across boards. At */10 this was 144 scheduled
+# dispatches a day — the single highest-frequency cron in the repo — spent on that no-op, while
+# materialize-paths was landing ~2% of its own */20 slots. GeckoTerminal (`trending-gt`) already
+# stands in for this board. Re-enable the cron by uncommenting when the quota is topped up;
+# workflow_dispatch still works for a manual check.
 on:
-  schedule:
-    - cron: '*/10 * * * *'
+  # schedule:
+  #   - cron: '*/10 * * * *'
   workflow_dispatch: {}
 
 concurrency:

@@ -150,7 +150,7 @@ def set_horizon_mark(bars_by_mint):
 
 
 def simulate(bars, rule, fetched_to=None):
-    """bars: [(ts,o,h,l,c)] from entry. Returns (gross_return, exit_ts, closed).
+    """bars: [(ts,o,h,l,c,vol)] from entry. Returns (gross_return, exit_ts, closed).
     Within a bar the LOW is assumed hit before the HIGH — stops fill before targets.
     `closed` is False when the horizon has not elapsed in the data yet: an OPEN position, which
     callers must drop rather than score."""
@@ -164,7 +164,7 @@ def simulate(bars, rule, fetched_to=None):
     peak = p0
     banked = 0.0
     frac_left = 1.0
-    for (ts, o, h, l, c) in bars[1:]:
+    for (ts, o, h, l, c, *_v) in bars[1:]:
         if ts >= horizon_ts:                      # hard time exit — a real, placeable order
             r = c / p0 - 1
             if kind == "partial" and frac_left < 1.0:
@@ -305,11 +305,15 @@ def load_entries(solat):
     bars_raw, CH = [], int(os.environ.get("BAR_MINT_CHUNK", "40"))
     for i in range(0, len(all_mints), CH):
         sel = all_mints[i:i + CH]
-        bars_raw += sb_all("/trending_bars?select=mint,ts,o,h,l,c"
+        bars_raw += sb_all("/trending_bars?select=mint,ts,o,h,l,c,vol"
                            "&mint=in.(" + ",".join(sel) + ")&order=mint.asc,ts.asc")
     bars = defaultdict(list)
     for b in bars_raw:
-        bars[b["mint"]].append((b["ts"], b["o"], b["h"], b["l"], b["c"]))
+        # vol rides on every bar as element 5. Without it nothing downstream can tell a real
+        # move from a bad print on a dead token: one Solana path returned +274,808,400% off three
+        # bars whose TOTAL volume was $0.40, and it alone moved the capped_net mean from about
+        # -25% to +42,873%.
+        bars[b["mint"]].append((b["ts"], b["o"], b["h"], b["l"], b["c"], b.get("vol") or 0.0))
     for m in bars:
         bars[m].sort()
     hw = set_horizon_mark(bars)

@@ -51,7 +51,7 @@ def shape(bars, solat, t0):
         return {}
     a0 = solat(t0)
     out, hi, lo, hi_t, lo_t = {}, p0, p0, 0, 0
-    for (ts, o, h, l, c) in bars[1:]:
+    for (ts, o, h, l, c, *_v) in bars[1:]:
         if h > hi: hi, hi_t = h, ts
         if l < lo: lo, lo_t = l, ts
     def sol(r, ts):
@@ -84,6 +84,11 @@ def main():
              "span_min": int((e["bars"][-1][0] - e["t0"]) / 60),
              "horizon_h": B.HORIZON_H, "liq_entry": e.get("liq")}
         r.update(shape(e["bars"], solat, e["t0"]))
+        # Traded volume across the FULL horizon, stored so a screen can apply its own
+        # size-appropriate participation limit without re-materialising. The floor applied inside
+        # pit_net_return is deliberately conservative (non-markets only); this column is the raw
+        # fact a stricter filter needs.
+        r["win_vol"] = V.window_volume(e["bars"], e["t0"], e["t0"] + B.HORIZON_H * 3600)
         for nm, rule in (("capped", G.CAPPED), ("runner", G.RUNNER)):
             g, xts, closed = B.simulate(e["bars"], rule, e.get("fetched_to"))
             r[f"{nm}_closed"] = bool(closed)

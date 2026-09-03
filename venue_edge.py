@@ -89,12 +89,46 @@ def route_at(rs, ts, stats=None):
     return rs[i][1], "ok"
 
 
+# A PRINT IS NOT A MARKET. Below this much traded volume across the holding window there is no
+# counterparty to have traded against, and the "return" is a quote artifact rather than a result.
+# Measured 2026-09-03: 245 Solana paths (3.7%) hold a window volume under $10, and that bucket
+# carries a mean capped_net of +11,216 against a median of -0.30 -- one path returned
+# +274,808,400% off three bars totalling $0.40, printing a low of 5.09e-12 and recovering the next
+# bar. Every bucket at $1k+ behaves sanely (max 1.6-13.1).
+#
+# The floor is deliberately CONSERVATIVE -- it rejects only non-markets, not merely thin ones --
+# because the right threshold depends on the notional being traded, which is an analysis-time
+# choice, not a materialisation-time one. `win_vol` is stored on every path row so a screen can
+# apply its own size-appropriate participation limit without re-materialising.
+#
+# Untradeable prints are scored ZERO, never dropped: dropping them selects on the outcome and is
+# survivorship in a new costume.
+MIN_WIN_USD = float(os.environ.get("MIN_WIN_USD", "10"))
+
+
+def window_volume(bars, t0, xts):
+    """USD traded across the holding window [t0, xts]. Bars carry vol at element 5.
+
+    RAISES if the bars carry no volume element at all. Defaulting to 0.0 there would put every
+    trade below the floor and silently zero the entire book — a plumbing bug presenting as a
+    uniform, plausible-looking result. A missing vol on an INDIVIDUAL bar is a real gap in the
+    feed and counts as 0; a missing element on EVERY bar is a wiring fault and must be loud."""
+    if bars and not any(len(b) > 5 for b in bars):
+        raise RuntimeError(
+            "bars carry no volume element — backtest.load_entries must select `vol` and append it "
+            "as element 5, or the notional floor zeroes every trade silently")
+    return sum((b[5] if len(b) > 5 else 0.0) or 0.0 for b in bars if t0 <= b[0] <= xts)
+
+
 def pit_net_return(e, rule, solat, routes, stats):
     """net return with PER-LEG, POINT-IN-TIME venue fees. Returns (net, entry_kind, exit_kind)."""
     g, xts, closed = B.simulate(e["bars"], rule, e.get("fetched_to"))
     if g is None or not closed:
         if g is not None: stats["open_position"] += 1
         return None, None, None
+    if window_volume(e["bars"], e["t0"], xts) < MIN_WIN_USD:
+        stats["untradeable_zeroed"] += 1
+        return 0.0, "untradeable", "untradeable"
     a, b = solat(e["t0"]), solat(xts)
     r = ((1 + g) * (a / b) - 1) if (a and b) else g          # SOL-denominated
     r_in, q_in = route_at(routes.get(e["mint"]), e["t0"], stats)

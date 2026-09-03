@@ -31,6 +31,12 @@ create table if not exists trending_paths (
   entry_venue text, exit_venue text,          -- point-in-time routed venue class per leg
   liq_entry double precision, liq_exit double precision,
   n_bars int, span_min int, last_bar_ts bigint,
+  -- USD traded across [entry_ts, entry_ts + horizon_h]. Stored so a screen can apply its own
+  -- size-appropriate participation limit without re-materialising; materialisation itself only
+  -- zeroes NON-MARKETS (window volume < MIN_WIN_USD, default $10). Added 2026-09-03 after one
+  -- path returned +274,808,400% off three bars totalling $0.40 and alone moved the capped_net
+  -- mean from ~-25% to +42,873%.
+  win_vol double precision,
   horizon_h double precision,                 -- the horizon these numbers were computed at
   computed_at timestamptz default now(),
   primary key (source, mint)

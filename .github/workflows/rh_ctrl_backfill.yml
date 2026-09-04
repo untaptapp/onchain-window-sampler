@@ -1,0 +1,39 @@
+name: rh-ctrl-backfill
+
+# Backfills bars for the rh_tape CONTROL arm around each control's matched as_of. Exists because
+# the false-positive cost of the revival front-run was UNMEASURABLE: 5/3/2/0/0/0 priced control
+# lead rows across the six leads (2026-09-04). GT OHLCV is backfillable, so this retroactively
+# completes a fixed, already-selected sample — see the docstring for why this is not the biased
+# "most active controls" sampling the main collector rightly refuses.
+#
+# Its own workflow ON PURPOSE: GeckoTerminal's keyless limit is per-IP (B-GT-RATE), so a separate
+# runner brings its own ~5-6 req/min instead of taxing the case-arm collectors. The task is FINITE
+# (~4k windows); once "0 mints still need their window", the schedule below should be removed.
+on:
+  schedule:
+    - cron: '5 */4 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: rh-ctrl-backfill
+  cancel-in-progress: false     # resumable batch work — never kill it mid-window (C-CRON)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GT_NETWORK: 'robinhood'
+          MIN_WALLETS: '5'
+          MAX_CALLS: '2400'
+          RUN_SECONDS: '18000'
+          SLEEP: '2.1'
+        run: python rh_ctrl_backfill.py

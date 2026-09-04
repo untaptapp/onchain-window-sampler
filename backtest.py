@@ -307,6 +307,35 @@ def load_entries(solat):
         sel = all_mints[i:i + CH]
         bars_raw += sb_all("/trending_bars?select=mint,ts,o,h,l,c,vol"
                            "&mint=in.(" + ",".join(sel) + ")&order=mint.asc,ts.asc")
+    # BAD TICKS: the feed prints highs and lows that never traded.
+    # One Solana token quoted a high of 1038.05 while trading at ~1e-5 -- 86,786,216x its own low --
+    # and because every trailing rule reads `h` to set its peak, that single tick produced a
+    # capped_net of +1,241,169 on a token whose bars are otherwise clean and well traded ($305k
+    # across the window, so the notional floor cannot catch it). mfe_pct is corrupted the same way.
+    #
+    # o and c are cross-validated -- they chain to the adjacent bars -- while h and l are single
+    # prints with nothing to check them against. Grounded on the corpus: h/max(o,c) is 1.007 at p50,
+    # 1.45 at p99, 3.09 at p99.9, then 89x at p99.99 and 143,386,311x at the maximum. Real
+    # volatility stops around 3x, so 10x sits above the 99.9th percentile and below the break.
+    # Clamp rather than drop: the rest of the bar is good data.
+    #
+    # This is deliberately NOT the same judgement as the notional floor. A bad tick is the feed
+    # being WRONG and gets corrected; a thin market is the feed being RIGHT about a market nobody
+    # could trade, which is recorded in win_vol and filtered at analysis time.
+    BAD_TICK_X = float(os.environ.get("BAD_TICK_X", "10"))
+    nclamp_h = nclamp_l = 0
+    for b in bars_raw:
+        o, c, h, l = b.get("o"), b.get("c"), b.get("h"), b.get("l")
+        if None in (o, c, h, l):
+            continue
+        top, bot = max(o, c), min(o, c)
+        if top > 0 and h > BAD_TICK_X * top:
+            b["h"] = top; nclamp_h += 1
+        if bot > 0 and l < bot / BAD_TICK_X:
+            b["l"] = bot; nclamp_l += 1
+    if nclamp_h or nclamp_l:
+        print(f"bad ticks clamped at {BAD_TICK_X:g}x: {nclamp_h} highs, {nclamp_l} lows "
+              f"({100*(nclamp_h+nclamp_l)/max(len(bars_raw),1):.4f}% of bars)", flush=True)
     bars = defaultdict(list)
     for b in bars_raw:
         # vol rides on every bar as element 5. Without it nothing downstream can tell a real

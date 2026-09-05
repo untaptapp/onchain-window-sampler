@@ -36,15 +36,16 @@ PRE_S, POST_S = 3600, 10800 + 900          # [as_of-1h, as_of+3h(+tolerance)] pe
 
 def main():
     t_end = time.time() + RUN_SECONDS if RUN_SECONDS else None
-    rows = TB.sb_all("/rh_tape?arm=eq.control&select=mint,as_of,n_wallets"
+    rows = TB.sb_all("/rh_tape?arm=eq.control&select=mint,as_of,n_wallets,lead_s"
                      "&order=as_of.asc,mint.asc")
     want = {}
     for r in rows:
         m = r["mint"]
-        w = want.setdefault(m, [r["as_of"] - PRE_S, r["as_of"] + POST_S, 0])
+        w = want.setdefault(m, [r["as_of"] - PRE_S, r["as_of"] + POST_S, 0, 0])
         w[0] = min(w[0], r["as_of"] - PRE_S)
         w[1] = max(w[1], r["as_of"] + POST_S)
         w[2] = max(w[2], r.get("n_wallets") or 0)
+        w[3] = max(w[3], r.get("lead_s") or 0)
     want = {m: w for m, w in want.items() if w[2] >= MIN_WALLETS}
     print(f"{len(rows):,} control rows -> {len(want):,} mints at >= {MIN_WALLETS} wallets", flush=True)
 
@@ -54,7 +55,7 @@ def main():
              TB.sb_all("/trending_pools?select=mint,ok,pool_address&mint=like.0x*")}
 
     todo = []
-    for m, (lo, hi, w) in want.items():
+    for m, (lo, hi, w, ls) in want.items():
         c = cov.get(m)
         if c and c[0] is not None and c[0] <= lo + 180 and c[1] >= hi - 180:
             continue                                   # window already covered
@@ -63,8 +64,12 @@ def main():
             continue                                   # known unresolvable: no GT pool exists
         if p is not None and (p.get("last_fetch_to") or 0) >= hi - 180:
             continue                                   # already asked to the window end
-        todo.append((m, lo, hi, w))
-    todo.sort(key=lambda x: -x[3])                     # most analysis-relevant first
+        todo.append((m, lo, hi, w, ls))
+    # LONG-LEAD CONTROLS FIRST. The revival front-run's false-positive cost lives in the
+    # L>=900 comparators, and wallet-count ordering alone left them starved: after 2,823
+    # fetched windows the priced control counts at L=900/1800/3600 were still 2/0/1. A control
+    # matched at a long lead outranks any wallet count; within a tier, most active first.
+    todo.sort(key=lambda x: (-(x[4] >= 900), -x[3]))
     print(f"{len(todo):,} mints still need their window", flush=True)
 
     # resolve missing pools in batches of 30 (1 GT call each)
@@ -93,7 +98,7 @@ def main():
         if new_cov:
             TB.sb("POST", "/trending_bar_cov?on_conflict=mint", new_cov,
                   prefer="resolution=merge-duplicates,return=minimal")
-    for m, lo, hi, w in todo:
+    for m, lo, hi, w, ls in todo:
         if TB.calls["n"] >= TB.MAX_CALLS or (t_end and time.time() >= t_end):
             print("  budget reached — stopping cleanly", flush=True)
             break

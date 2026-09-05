@@ -345,6 +345,32 @@ def load_entries(solat):
         bars[b["mint"]].append((b["ts"], b["o"], b["h"], b["l"], b["c"], b.get("vol") or 0.0))
     for m in bars:
         bars[m].sort()
+    # DUST PRINTS: a bar that reprices the token >10x on under $10 of volume is not a market
+    # event, whatever the AMM math says -- it is the pool being drained or a rounding artifact,
+    # and no position exits at that price. The h/l clamp above cannot catch these because the
+    # bar's own o and c ARE the garbage: one token's dying bars printed c=185.73 then c=1038.05
+    # on $1.00 of volume each (real price ~1.5e-4), fed the trailing rule's peak through its own
+    # endpoints, and produced capped_net = +1,241,169 on an otherwise clean, $305k-volume path.
+    # Measured: 497 SOL bars on 362 mints (and 8 RH) fit vol<$10 AND >10x jump from the previous
+    # kept close; funded jumps (vol>=$10) number 1,715/586 and are left strictly alone -- launch
+    # price discovery and real rugs are data, not defects. The comparison chains against the last
+    # KEPT close so a run of dust bars cannot ratchet the baseline onto garbage.
+    DUST_USD = float(os.environ.get("DUST_USD", "10"))
+    ndust = 0
+    for m in bars:
+        kept, pc = [], None
+        for b in bars[m]:
+            c = b[4]
+            if (pc and c and pc > 0 and c > 0 and (b[5] or 0) < DUST_USD
+                    and (c / pc > 10 or pc / c > 10)):
+                ndust += 1
+                continue
+            kept.append(b)
+            if c and c > 0:
+                pc = c
+        bars[m] = kept
+    if ndust:
+        print(f"dust prints dropped: {ndust} bars repricing >10x on <${DUST_USD:g} volume", flush=True)
     hw = set_horizon_mark(bars)
     print(f"bars: {len(bars_raw):,} rows across {len(bars):,} mints "
           f"| horizon {HORIZON_H}h, collector high-water {time.strftime('%Y-%m-%d %H:%M', time.gmtime(hw))}Z",

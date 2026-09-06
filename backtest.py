@@ -73,6 +73,50 @@ def sb_all(path, page=1000, cap=800000, tries=5):
     return out
 
 
+def sb_keyset(filters, select, page=1000, cap=800000, tries=5):
+    """Page a large table by `id` keyset instead of Range offsets.
+
+    Range offsets make PostgREST sort/skip an ever-growing prefix on EVERY page — the snapshot
+    read was O(n²) in table size and alone pushed materialize-paths from 18 min into its 90-min
+    kill once trending_snapshots passed ~250k rows. `id > last` with `order=id.asc` is one pkey
+    index-range scan per page, flat in table size. Rows come back in id order, which is NOT
+    guaranteed to be capture order — callers that need time order must sort what they get.
+    `filters` is the query-string fragment WITHOUT select/order/limit (e.g. "source=eq.gmgn").
+    """
+    out, last_id = [], None
+    while len(out) < cap:
+        q = f"/trending_snapshots?{filters}&select=id,{select}&order=id.asc&limit={page}"
+        if last_id is not None:
+            q += f"&id=gt.{last_id}"
+        chunk = None
+        for attempt in range(tries):
+            try:
+                h = {"apikey": KEY, "Authorization": f"Bearer {KEY}"}
+                with urllib.request.urlopen(urllib.request.Request(SB + q, headers=h), timeout=120) as r:
+                    t = r.read(); chunk = json.loads(t) if t else []
+                break
+            except urllib.error.HTTPError as e:
+                if e.code < 500 or attempt == tries - 1:
+                    raise
+                time.sleep(3 * (attempt + 1))
+            except Exception:
+                if attempt == tries - 1:
+                    raise
+                time.sleep(3 * (attempt + 1))
+        if chunk is None:
+            raise RuntimeError(f"sb_keyset: page after id {last_id} never returned for {filters[:60]}")
+        if not chunk:
+            break
+        out += chunk
+        last_id = chunk[-1]["id"]
+        if len(chunk) < page:
+            break
+    if len(out) >= cap:
+        print(f"!! sb_keyset cap reached ({cap}) for {filters[:70]} — RESULT IS TRUNCATED, raise cap",
+              flush=True)
+    return out
+
+
 # ---- execution cost: measured Jupiter curve, cost% = a * size_usd^b per TVL band ----------
 BANDS = ((0, 15000), (15000, 50000), (50000, 200000), (200000, 1e6), (1e6, 9e12))
 FIT = {0: (0.112, 0.77), 1: (0.937, 0.29), 2: (0.901, 0.17), 3: (0.168, 0.22), 4: (0.039, 0.87)}
@@ -291,9 +335,16 @@ def load_entries(solat):
     # on every single run. Intersecting with the analysis sources first halves the read, which is
     # what pushed materialize-paths past its 60-minute timeout and left the forward-test sample
     # stale for a day. Purely a cost change: a mint outside this set was never used.
-    ana = set()
+    # One keyset read per source, reused twice: the mint set scopes the bar read here, and the
+    # full rows feed the per-source entry loop below. The old code paged this table FOUR times
+    # per run (3× mint-only + 3× full, all by Range offset) — see sb_keyset for why that became
+    # the whole runtime.
+    snap_rows, ana = {}, set()
     for _s in ANALYSIS_SOURCES:
-        ana |= {r["mint"] for r in sb_all(f"/trending_snapshots?source=eq.{_s}&select=mint")}
+        snap_rows[_s] = sb_keyset(f"source=eq.{_s}",
+                                  "mint,captured_at,rank,price,market_cap,liquidity,extra")
+        snap_rows[_s].sort(key=lambda r: r["captured_at"])   # id order is not capture order
+        ana |= {r["mint"] for r in snap_rows[_s]}
     prows = sb_all("/trending_pools?select=mint,last_fetch_to&ok=is.true")
     ok_mints = {r["mint"] for r in prows}
     # How far the collector actually ASKED for each mint. Used as the per-mint horizon mark, so
@@ -378,8 +429,7 @@ def load_entries(solat):
     ents = []
     dropped = defaultdict(int)
     for src in ANALYSIS_SOURCES:
-        rows = sb_all(f"/trending_snapshots?source=eq.{src}"
-                      "&select=mint,captured_at,rank,price,market_cap,liquidity,extra&order=captured_at.asc")
+        rows = snap_rows[src]   # already read (keyset) and sorted by captured_at above
         seen = {}
         liqser = defaultdict(list)
         for r in rows:

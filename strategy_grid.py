@@ -44,8 +44,8 @@ def ff(v):
 
 def enrich(ents):
     """Attach board features, age and venue to each entry."""
-    rows = B.sb_all("/trending_snapshots?source=eq.gmgn"
-                    "&select=mint,captured_at,rank,market_cap,liquidity,extra&order=captured_at.asc")
+    rows = B.sb_keyset("source=eq.gmgn", "mint,captured_at,rank,market_cap,liquidity,extra")
+    rows.sort(key=lambda r: r["captured_at"])   # keyset returns id order, not capture order
     seen = {}
     for r in rows:
         if r["mint"] not in seen: seen[r["mint"]] = r

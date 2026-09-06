@@ -2,8 +2,15 @@
 --
 -- Runs entirely in the database: one pass over trending_bars instead of an ~88 MB client read
 -- (A6/A9), and callable through PostgREST /rpc with only SUPABASE_KEY -- no management token in a
--- workflow secret. authenticator/service_role carry statement_timeout=120s (C-TIMEOUT) and this
--- takes ~17s, so it fits with headroom.
+-- workflow secret. authenticator/service_role carry statement_timeout=120s (C-TIMEOUT).
+--
+-- INCREMENTAL: a path row is FINAL once its ret_12h is non-null -- the 12h window closed and was
+-- computed -- so those mints are skipped. The full recompute grew past the 120s statement budget
+-- (57014 on every run by 2026-09-06, ~4 attempts wasted per materialize pass), and it also
+-- silently DEGRADED finished rows whenever bar retention had pruned part of a window: each rerun
+-- rewrote n_bars/mfe/mae from whatever bars remained. Skipping frozen rows fixes both. A mint
+-- whose entry bar is later pruned before its 12h closes simply stops matching `e` and its row
+-- keeps the last honest computation.
 --
 -- DELIBERATE DIVERGENCE FROM THE SOLANA PATH: a horizon counts as reached when the CORPUS of EVM
 -- bars has passed it, not when this token's own bars do. materialize_paths.py uses the latter,
@@ -23,8 +30,12 @@ security definer
 as $function$
 declare n integer;
 begin
-  with fs as (select mint, min(captured_at)/1000.0 t0 from trending_snapshots
-              where source='gmgn_rh' group by mint),
+  with fs as (select s.mint, min(s.captured_at)/1000.0 t0 from trending_snapshots s
+              where s.source='gmgn_rh'
+                and not exists (select 1 from trending_paths tp
+                                where tp.source='gmgn_rh' and tp.mint=s.mint
+                                  and tp.ret_12h is not null)
+              group by s.mint),
        bb as (select mint, created_at born from rh_launches
               where birth_kind in ('launchpad','mint_event')),
        j  as (select fs.mint, fs.t0, bb.born from fs left join bb using (mint)),

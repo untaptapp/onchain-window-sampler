@@ -2,7 +2,11 @@
 --
 -- Runs entirely in the database: one pass over trending_bars instead of an ~88 MB client read
 -- (A6/A9), and callable through PostgREST /rpc with only SUPABASE_KEY -- no management token in a
--- workflow secret. authenticator/service_role carry statement_timeout=120s (C-TIMEOUT).
+-- workflow secret. authenticator/service_role carry statement_timeout=120s (C-TIMEOUT) — which
+-- this function OUTGREW: since 2026-09-06 it is invoked by pg_cron job 'materialize-rh-paths'
+-- (*/20 * * * *, command: set statement_timeout='900s'; select public.materialize_rh_paths(300);)
+-- and materialize_rh.py is only a freshness sentinel. Job health:
+--   select * from cron.job_run_details order by start_time desc limit 5;
 --
 -- INCREMENTAL: a path row is FINAL once its ret_12h is non-null -- the 12h window closed and was
 -- computed -- so those mints are skipped. The full recompute grew past the 120s statement budget
@@ -30,8 +34,15 @@ security definer
 as $function$
 declare n integer;
 begin
+  -- The 14-day floor bounds the todo: a mint first seen weeks ago that still has no entry bar
+  -- will never get one from the case-arm collector (its window has left retention), so re-probing
+  -- it every run is a permanent cost that only grows. FORECLOSED by this cap (C0d): a path row
+  -- for an old case mint whose bars arrive late through some other route (e.g. the control-arm
+  -- backfill fetching the same window). Measured 2026-09-06: 2,767 todo mints, 2,472 of which can
+  -- never produce an entry — 27s of lateral probes per run for nothing.
   with fs as (select s.mint, min(s.captured_at)/1000.0 t0 from trending_snapshots s
               where s.source='gmgn_rh'
+                and s.captured_at >= (extract(epoch from now()) - 14*86400)*1000
                 and not exists (select 1 from trending_paths tp
                                 where tp.source='gmgn_rh' and tp.mint=s.mint
                                   and tp.ret_12h is not null)
@@ -39,7 +50,10 @@ begin
        bb as (select mint, created_at born from rh_launches
               where birth_kind in ('launchpad','mint_event')),
        j  as (select fs.mint, fs.t0, bb.born from fs left join bb using (mint)),
-       hh as (select max(ts) tmax from trending_bars where mint like '0x%'),
+       -- High-water = how far collection ASKED (trending_pools.last_fetch_to), not how far bars
+       -- happen to go. Same semantics as Solana's fetched_to mark, and O(pools) instead of an
+       -- 18s index scan over every 0x bar row that grows with the bar table forever.
+       hh as (select max(last_fetch_to) tmax from trending_pools where mint like '0x%'),
        e  as (select j.mint, j.t0, j.born, hh.tmax, en.o p_entry
               from j cross join hh
               left join lateral (select tb.o from trending_bars tb

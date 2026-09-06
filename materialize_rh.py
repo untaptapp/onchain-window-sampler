@@ -1,57 +1,66 @@
 #!/usr/bin/env python3
-"""Materialise Robinhood board-entry paths into `trending_paths` (source='gmgn_rh').
+"""SENTINEL for Robinhood path materialisation — the work itself moved to pg_cron.
 
-This is a thin caller: the work is `materialize_rh_paths()` in the database (source of truth
-`materialize_rh.sql`, but read pg_get_functiondef before trusting that file — C0b). Doing it in the
-DB means one pass over trending_bars instead of an ~88 MB client read (A6/A9), and it needs only
-SUPABASE_KEY rather than a management token in a workflow secret.
+`materialize_rh_paths()` outgrew PostgREST's 120s statement budget (57014 on every attempt once
+trending_bars passed ~3M rows), and batching can't fix it: mints that never get an entry bar stay
+in the todo forever, so a newest-first batch fills with them and deadlocks. Since 2026-09-06 the
+function runs INSIDE the database as pg_cron job 'materialize-rh-paths' (*/20, with its own
+`set statement_timeout='900s'` — a function-level SET cannot extend an already-armed timer).
 
-WHY NOT materialize_paths.py
-----------------------------
-That script is built on SOL denomination (`backtest.load_sol`) and Jupiter route quotes
-(`venue_edge.load_routes`). Robinhood has neither, so running RH through it would crash or silently
-produce SOL-adjusted returns for a chain that does not trade against SOL. Measured 2026-09-02,
-`trending_paths` held ZERO EVM rows: every derived return in this project was Solana-only and RH
-returns had never been materialised at all. The Solana-only columns stay NULL here rather than faked.
+This script only VERIFIES the cron is alive, per C0f: judge data recency, not run status. It fails
+the workflow when paths are stale WHILE work is waiting — max(computed_at) old AND unfrozen recent
+mints exist. A quiet board with nothing to do is not a failure.
 
-Returns are USD-denominated, which is right for this chain: the dominant quote asset is USDG, a USD
-stablecoin (12 of the top 20 pools by GeckoTerminal; WETH is 4). The WETH-quoted minority does carry
-an ETH/USD component — recorded, not silently adjusted.
-
-Env: SUPABASE_URL, SUPABASE_KEY, ENTRY_TOL_S (default 300).
+Env: SUPABASE_URL, SUPABASE_KEY. STALE_MIN (default 120).
 """
-import json, os, sys, time, urllib.error, urllib.request
+import json, os, urllib.request
 
 SB = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1"
 KEY = os.environ["SUPABASE_KEY"]
-ENTRY_TOL_S = int(os.environ.get("ENTRY_TOL_S", "300"))
+STALE_MIN = int(os.environ.get("STALE_MIN", "120"))
+
+
+def q(path):
+    h = {"apikey": KEY, "Authorization": f"Bearer {KEY}",
+         "User-Agent": "onchain-window-sampler/1.0"}
+    with urllib.request.urlopen(urllib.request.Request(SB + path, headers=h), timeout=120) as r:
+        return json.load(r)
 
 
 def main():
-    h = {"apikey": KEY, "Authorization": f"Bearer {KEY}", "Content-Type": "application/json",
-         "User-Agent": "onchain-window-sampler/1.0"}
-    body = json.dumps({"entry_tol_s": ENTRY_TOL_S}).encode()
-    t = time.time()
-    for a in range(4):
-        try:
-            req = urllib.request.Request(SB + "/rpc/materialize_rh_paths", data=body,
-                                         headers=h, method="POST")
-            with urllib.request.urlopen(req, timeout=300) as r:
-                n = r.read().decode().strip()
-            print(f"materialize_rh_paths -> {n} rows in {time.time() - t:.0f}s", flush=True)
-            return
-        except urllib.error.HTTPError as e:
-            body_txt = e.read().decode()[:300]
-            # 57014 is a statement timeout returned as HTTP 500; read the BODY, not the code
-            # (C-TIMEOUT). Retrying is only useful for a transient, so fail loud after four.
-            if a == 3:
-                raise SystemExit(f"materialize_rh_paths failed {e.code}: {body_txt}")
-            print(f"  attempt {a + 1} failed {e.code}: {body_txt}", flush=True)
-            time.sleep(5 * (a + 1))
-        except Exception as e:
-            if a == 3:
-                raise SystemExit(f"materialize_rh_paths failed: {e!r}")
-            time.sleep(5 * (a + 1))
+    import time
+    now = time.time()
+    rows = q("/trending_paths?source=eq.gmgn_rh&select=computed_at&order=computed_at.desc&limit=1")
+    if not rows:
+        raise SystemExit("no gmgn_rh rows in trending_paths at all — cron never ran")
+    from datetime import datetime, timezone
+    mx = datetime.fromisoformat(rows[0]["computed_at"].replace("Z", "+00:00")).timestamp()
+    age_min = (now - mx) / 60
+    print(f"gmgn_rh paths: newest computed_at {age_min:.0f} min ago", flush=True)
+    if age_min <= STALE_MIN:
+        return
+    # Stale — but is there work waiting? A mint first seen 1–13h ago should have a path row by
+    # now if it will ever get one (entry bar within tolerance arrives with the bar collector's
+    # lag, well under an hour).
+    lo = int((now - 13 * 3600) * 1000)
+    hi = int((now - 3600) * 1000)
+    recent = q(f"/trending_snapshots?source=eq.gmgn_rh&select=mint&captured_at=gte.{lo}"
+               f"&captured_at=lte.{hi}&limit=1000")
+    mints = sorted({r["mint"] for r in recent})
+    if not mints:
+        print("stale but no recent board mints — nothing to materialise, OK", flush=True)
+        return
+    have = set()
+    for i in range(0, len(mints), 80):
+        sel = ",".join(mints[i:i + 80])
+        have |= {r["mint"] for r in q(f"/trending_paths?source=eq.gmgn_rh&select=mint&mint=in.({sel})")}
+    missing = len(set(mints) - have)
+    print(f"recent mints {len(mints)}, with path row {len(have)}, missing {missing}", flush=True)
+    if missing > len(mints) * 0.5:
+        raise SystemExit(f"paths {age_min:.0f} min stale with {missing}/{len(mints)} recent mints "
+                         "unmaterialised — pg_cron job 'materialize-rh-paths' looks dead "
+                         "(select * from cron.job_run_details order by start_time desc)")
+    print("stale computed_at but recent mints are covered — OK", flush=True)
 
 
 if __name__ == "__main__":

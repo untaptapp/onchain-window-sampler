@@ -1,0 +1,40 @@
+name: rh-span-backfill
+
+# Backfills minute bars across the FULL TRENDING LIFESPAN of re-trending Robinhood mints.
+# The case-arm collector rotates ~9k mints through a ~5/min GT budget, so tokens that STAY on the
+# board get their open window extended ~once every two days — coverage on three currently-trending
+# mints ended 60-172h before their latest sighting (2026-09-06), excluding every late re-ignition
+# from analysis. GT serves minute OHLCV 100+ hours back, so the lifespan is recoverable.
+#
+# Own workflow = own runner IP (B-GT-RATE). NOT finite: a token that keeps trending keeps growing
+# its span, so this doubles as the continuous-coverage mechanism for board-resident tokens and
+# stays scheduled. Coverage credit makes every run resume where the last stopped.
+on:
+  schedule:
+    - cron: '35 */4 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: rh-span-backfill
+  cancel-in-progress: false     # resumable batch work — never kill it mid-window (C-CRON)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GT_NETWORK: 'robinhood'
+          MIN_SPAN_H: '6'
+          MAX_SPAN_D: '14'
+          MAX_CALLS: '2400'
+          RUN_SECONDS: '18000'
+          SLEEP: '2.1'
+        run: python rh_span_backfill.py

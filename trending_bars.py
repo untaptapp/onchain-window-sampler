@@ -309,7 +309,11 @@ def fetch_bars(pool, need_from, need_to):
 
     Returns (bars, landed). `landed` is False when a page never came back — the caller must NOT
     then stamp last_fetch_to, or our own rate limit is recorded as this token's silence."""
-    got, before, landed = {}, None, True
+    # Page from the TOP OF THE WINDOW, not from now. Starting at `now` with the 4-page cap means
+    # any window whose end sits deeper than ~66h can never be reached — every call re-fetches the
+    # same recent pages and gives up, which silently starved the deepest backfill windows. For the
+    # live collector need_to ≈ now, so this is behaviourally identical there.
+    got, before, landed = {}, int(need_to) + 120, True
     for _ in range(4):
         u = f"{GT}/pools/{pool}/ohlcv/minute?aggregate=1&limit=1000"
         if before:

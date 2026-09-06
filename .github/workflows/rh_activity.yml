@@ -1,0 +1,34 @@
+name: rh-activity
+
+# Hourly DexScreener sweep of the whole rh_launches population -> rh_activity. Gives the
+# revival-front-run base rate an unbiased denominator (bars coverage is survivorship-tilted),
+# and is the live input a front-run detector would poll. Snapshots are unbackfillable, so this
+# runs continuously (B3). Self-poll with cron as restart heartbeat; cancel-in-progress:true
+# because a dropped restart loses unbackfillable sweeps (C-CRON), and an interrupted sweep
+# costs only free DexScreener calls.
+on:
+  schedule:
+    - cron: '18,48 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: rh-activity
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          RUN_SECONDS: '18000'
+          PASS_INTERVAL: '3600'
+          SLEEP: '0.25'
+        run: python rh_activity.py

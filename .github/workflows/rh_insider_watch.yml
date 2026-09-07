@@ -1,0 +1,37 @@
+name: rh-insider-watch
+
+# Door-#1 forward test: watches the FROZEN insider roster (rh_insider_roster) for cohort
+# arrivals on new tokens, records first-touches and signals, and Kyber-quotes execution cost at
+# every signal moment. Spec: research/insider-cohort-forward-test.md — the roster and signal
+# definitions are frozen; this collector records and never evaluates.
+#
+# Bookmarked by block in rh_state: a dropped run backfills exactly, so cancel-in-progress stays
+# false (resumable batch semantics, C-CRON). Cron is the restart heartbeat, not the poll rate —
+# the collector self-polls every PASS_INTERVAL inside RUN_SECONDS.
+on:
+  schedule:
+    - cron: '12,42 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: rh-insider-watch
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          RUN_SECONDS: '18000'
+          PASS_INTERVAL: '120'
+          MAX_RPC: '6000'
+          CHUNK_BLOCKS: '100000'
+        run: python rh_insider_watch.py

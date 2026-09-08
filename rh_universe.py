@@ -394,7 +394,7 @@ def one_pass(quotes):
     if mark >= latest:
         print(f"  bookmark {mark:,} is at head {latest:,} — nothing to scan", flush=True)
         return 0
-    rows, used, reached, pool_rows = scan(mark + 1, latest, MAX_CALLS, quotes)
+    rows, used, reached, fee_rows = scan(mark + 1, latest, MAX_CALLS, quotes)
     # WRITE THE LAUNCHES FIRST. `fill_creators` is up to CREATOR_CALLS sequential
     # eth_getTransactionByHash calls — 400 of them at 0.25s pacing is 100s at best, and minutes
     # once this node starts backing off. Doing it before the write put the ESSENTIAL data (the
@@ -426,6 +426,11 @@ def one_pass(quotes):
         # the INSERT, and NOT NULL on created_at/block_number/factory/topic0/first_seen_at is
         # checked before conflict resolution — a partial payload would 400 the whole batch.
         C.sb_write("/rh_launches?on_conflict=mint", [r for r in rows if r.get("creator")])
+    # NOTE the two similarly-named locals: `pool_rows` above are rh_LAUNCHES rows whose birth
+    # came from a pool event, while `fee_rows` are rh_POOL_FEES rows. Calling the scan return
+    # `pool_rows` shadowed the launch list and posted launch-shaped rows to /rh_pool_fees, which
+    # PostgREST 400s -- caught by the except below, so launches were untouched, but the fee write
+    # was inert for the first hour after deploy and only the pass line said so.
     # Pool fees LAST and in their own try/except. This is an additive feature; a failure here
     # must be loud but must never cost a launch row, and by this point the launches and the
     # bookmark have already landed. ignore-duplicates because a pool's fee is set at creation and
@@ -433,10 +438,15 @@ def one_pass(quotes):
     fee_note = ""
     if POOL_FEES:
         try:
-            fw = C.sb_write("/rh_pool_fees?on_conflict=pool_id", pool_rows,
+            # Name the shape before posting it. sb_write would have raised anyway (PostgREST
+            # 400s an unknown column), but "PGRST204 pool_id not found" does not say WHICH list
+            # was passed, and the answer cost an hour of inert collection once already.
+            assert all("pool_id" in r for r in fee_rows), \
+                "fee_rows is not pool-shaped -- a launch list was passed to /rh_pool_fees"
+            fw = C.sb_write("/rh_pool_fees?on_conflict=pool_id", fee_rows,
                             prefer="resolution=ignore-duplicates,return=minimal")
-            dyn = sum(1 for r in pool_rows if r["fee_dynamic"])
-            fee_note = f", {fw}/{len(pool_rows)} pool fees ({dyn} dynamic)"
+            dyn = sum(1 for r in fee_rows if r["fee_dynamic"])
+            fee_note = f", {fw}/{len(fee_rows)} pool fees ({dyn} dynamic)"
         except Exception as ex:
             # C5b: a silently-skipped subcomponent looks identical to a healthy one. Say it loudly
             # in the pass line, where the operator is already looking.

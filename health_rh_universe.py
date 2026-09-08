@@ -65,6 +65,12 @@ if age>45: fail.append(f"bookmark stale ({age:.0f} min)")
 tot=cnt("/rh_pool_fees?select=pool_id")
 new=cnt(f"/rh_pool_fees?select=pool_id&first_seen_at=gte.{SINCE}")
 print(f"\n3. rh_pool_fees: {tot:,} rows total, {new:,} written since reference")
+# The failure this exists to catch: launches flowing while fees do not. That is the signature of
+# the fee write erroring out inside its own try/except -- isolated, so nothing breaks and nothing
+# says so except one line in a 5-hour log. Only meaningful once launches have actually moved.
+if post > 200 and new == 0:
+    fail.append(f"pool fees STALLED: {post:,} launches written since reference but 0 fees "
+                "(the fee write is erroring inside its try/except -- read the pass line)")
 # invariants that must hold on EVERY row, checked server-side
 bad_dyn=cnt("/rh_pool_fees?select=pool_id&fee_dynamic=is.true&fee_ppm=not.is.null")
 bad_hook=cnt("/rh_pool_fees?select=pool_id&fee_dynamic=is.true&hooks=eq.0x0000000000000000000000000000000000000000")

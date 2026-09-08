@@ -46,6 +46,10 @@ jobs:
           RUN_SECONDS: '18000'
           # The public RPC rate-limits, and the tape collector shares it. Pace both.
           RPC_MIN_INTERVAL: '0.25'
+          # v4 pool fees, decoded from the Initialize logs the amm_shared watch already fetches
+          # (+0 RPC calls). Set to '0' to disable if it ever misbehaves — the launch firehose is
+          # the essential job here and must not be held hostage to an additive feature.
+          POOL_FEES: '1'
         run: python rh_universe.py
       - name: recall audit
         if: always()

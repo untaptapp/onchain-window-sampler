@@ -54,6 +54,7 @@ TABLES = {
     "trending_snapshots": ("captured_at", ["mint", "captured_at", "source"]),
     "trending_pools":     ("resolved_at", ["mint"]),
     "rh_launches":        ("first_seen_at", ["mint"]),
+    "rh_pool_fees":       ("first_seen_at", ["pool_id"]),
     "rh_tape":            ("computed_at", ["mint", "as_of", "window_s"]),
     "pump_launches":      ("created_at", ["mint"]),
     "candidate_universe": ("captured_at", ["pool_address", "captured_at"]),

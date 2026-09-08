@@ -125,6 +125,47 @@ RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "18000"))
 
 _NOT_TOKEN = {t[1].lower() for t in WATCH} | {"0x" + "0" * 40}
 
+# ---- Uniswap v4 pool fees, read from the SAME Initialize logs the `amm_shared` watch fetches ----
+# Zero additional RPC calls: `scan()` already holds these logs. See schema_rh_pool_fees.sql for the
+# event layout and for why a dynamic fee is stored as NULL rather than as its 0x800000 sentinel.
+# Gated on the TOPIC, not on the watch entry's position, so adding another `pair` entry for a
+# non-v4 AMM cannot silently start decoding a different event's data words as a fee (A-ENTITY).
+V4_INIT_TOPIC = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438"
+V4_DYNAMIC_FEE = 0x800000       # the fee field's sentinel for "the hook decides, per swap"
+V4_MAX_FEE_PPM = 1_000_000      # uint24 fee is in ppm; 1e6 = 100%
+# Kill switch. This is an additive feature on a collector whose ESSENTIAL job is the launch
+# firehose; if the fee write ever misbehaves it must be disableable from the workflow env without
+# a code change and without touching the launches path.
+POOL_FEES = os.environ.get("POOL_FEES", "1") not in ("0", "", "false")
+
+
+def decode_v4_pool(log):
+    """Decode one v4 `Initialize` log into a pool-fee row, or None if it does not have the
+    expected shape. Returns a FIXED key set so a batch can never go ragged (A-SHAPE: PostgREST
+    rejects a mixed-shape bulk upsert with a bare 400 and discards the WHOLE batch)."""
+    tps = log.get("topics") or []
+    d = (log.get("data") or "0x")[2:]
+    if len(tps) != 4 or len(d) < 64 * 3:
+        return None
+    fee = int(d[0:64], 16)
+    dyn = bool(fee & V4_DYNAMIC_FEE)
+    # A dynamic pool has no fixed rate. Storing the raw sentinel would let a consumer compute
+    # 0x800000/1e6 = 838% and never notice, so the rate is NULL and any arithmetic on it is NULL
+    # rather than a confident wrong number (D17).
+    if dyn or fee > V4_MAX_FEE_PPM:
+        fee_ppm = None
+    else:
+        fee_ppm = fee
+    ts = int(d[64:128], 16)
+    ts = ts - (1 << 256) if ts >= (1 << 255) else ts        # int24, two's complement
+    bn = int(log["blockNumber"], 16)
+    return {"pool_id": tps[1].lower(),
+            "currency0": C.topic_addr(tps[2]), "currency1": C.topic_addr(tps[3]),
+            "fee_ppm": fee_ppm, "fee_dynamic": dyn,
+            "tick_spacing": ts, "hooks": "0x" + d[128:192][-40:],
+            "block_number": bn, "created_at": C.blk_to_ts(bn),
+            "first_seen_at": int(time.time())}
+
 
 def _plausible(a):
     return a not in _NOT_TOKEN and int(a, 16) > 0xffff
@@ -212,6 +253,29 @@ def selftest(sample=4, window_s=900):
     if bad:
         raise SystemExit("EXTRACTOR SELFTEST FAILED — refusing to write pool addresses as mints: "
                          + "; ".join(bad))
+    # The fee decoder is a second identity claim about the same logs (A-ENTITY), so it gets its own
+    # gate on real data. The check that actually bites is the last one: v4 requires a HOOK contract
+    # to set a dynamic fee, so `dynamic flag set` and `hooks != 0` must agree. If the data words
+    # ever shift — a different event decoded as Initialize — that agreement breaks long before the
+    # fee values look implausible.
+    if POOL_FEES:
+        v4 = [l for w, logs in raw.items() for l in logs if w[2] == V4_INIT_TOPIC]
+        dec = [r for r in (decode_v4_pool(l) for l in v4) if r]
+        if not dec:
+            print("  selftest v4 fees   no Initialize logs in the window — cannot verify",
+                  flush=True)
+        else:
+            dyn = [r for r in dec if r["fee_dynamic"]]
+            hooked = sum(1 for r in dyn if int(r["hooks"], 16) != 0)
+            print(f"  selftest v4 fees   {len(v4):5} logs -> {len(dec):5} pools, "
+                  f"{len(dyn)} dynamic, {hooked}/{len(dyn)} of those hooked", flush=True)
+            if len(dec) < len(v4) * 0.9:
+                raise SystemExit(f"V4 FEE SELFTEST FAILED — only {len(dec)}/{len(v4)} Initialize "
+                                 "logs had the expected shape")
+            if dyn and hooked < len(dyn):
+                raise SystemExit(f"V4 FEE SELFTEST FAILED — {len(dyn) - hooked} of {len(dyn)} "
+                                 "dynamic-fee pools have no hook contract; the data-word offsets "
+                                 "no longer match Initialize")
     return quotes
 
 
@@ -249,8 +313,11 @@ def write_bookmark(block):
 
 
 def scan(lo, hi, budget, quotes):
-    """Scan [lo, hi] across every watched factory. Returns (rows, calls_used, reached_block)."""
+    """Scan [lo, hi] across every watched factory.
+
+    Returns (rows, calls_used, reached_block, pool_fee_rows)."""
     out, reached = {}, lo - 1
+    pools = {}
     b = lo
     # Launchpad entries are processed before `pair` entries so that a token seen via its own
     # launchpad keeps that label rather than being relabelled by the pool event that follows it.
@@ -269,6 +336,14 @@ def scan(lo, hi, budget, quotes):
         for w in order:
             lp, fac, topic, how = w
             for lg in raw.get(w, []):
+                # Pool fees are collected BEFORE the mint dedup and independently of whether a
+                # mint could be extracted at all: the fee is a fact about the POOL, and a pool
+                # whose launch side we cannot name still has a fee. Deduping these by mint would
+                # discard every pool after a token's first.
+                if POOL_FEES and topic == V4_INIT_TOPIC:
+                    pr = decode_v4_pool(lg)
+                    if pr:
+                        pools.setdefault(pr["pool_id"], pr)
                 mint = extract(lg, how, quotes)
                 if not mint or mint in out:
                     continue
@@ -286,7 +361,7 @@ def scan(lo, hi, budget, quotes):
                              "first_seen_at": int(time.time())}
         reached = top
         b = top + 1
-    return list(out.values()), C.calls(), reached
+    return list(out.values()), C.calls(), reached, list(pools.values())
 
 
 def fill_creators(rows, budget):
@@ -319,7 +394,7 @@ def one_pass(quotes):
     if mark >= latest:
         print(f"  bookmark {mark:,} is at head {latest:,} — nothing to scan", flush=True)
         return 0
-    rows, used, reached = scan(mark + 1, latest, MAX_CALLS, quotes)
+    rows, used, reached, pool_rows = scan(mark + 1, latest, MAX_CALLS, quotes)
     # WRITE THE LAUNCHES FIRST. `fill_creators` is up to CREATOR_CALLS sequential
     # eth_getTransactionByHash calls — 400 of them at 0.25s pacing is 100s at best, and minutes
     # once this node starts backing off. Doing it before the write put the ESSENTIAL data (the
@@ -351,10 +426,25 @@ def one_pass(quotes):
         # the INSERT, and NOT NULL on created_at/block_number/factory/topic0/first_seen_at is
         # checked before conflict resolution — a partial payload would 400 the whole batch.
         C.sb_write("/rh_launches?on_conflict=mint", [r for r in rows if r.get("creator")])
+    # Pool fees LAST and in their own try/except. This is an additive feature; a failure here
+    # must be loud but must never cost a launch row, and by this point the launches and the
+    # bookmark have already landed. ignore-duplicates because a pool's fee is set at creation and
+    # is immutable for the life of the pool — a re-scan of the same range must not rewrite it.
+    fee_note = ""
+    if POOL_FEES:
+        try:
+            fw = C.sb_write("/rh_pool_fees?on_conflict=pool_id", pool_rows,
+                            prefer="resolution=ignore-duplicates,return=minimal")
+            dyn = sum(1 for r in pool_rows if r["fee_dynamic"])
+            fee_note = f", {fw}/{len(pool_rows)} pool fees ({dyn} dynamic)"
+        except Exception as ex:
+            # C5b: a silently-skipped subcomponent looks identical to a healthy one. Say it loudly
+            # in the pass line, where the operator is already looking.
+            fee_note = f", POOL FEE WRITE FAILED ({type(ex).__name__}: {ex})"
     span_h = (reached - mark) * bt / 3600
     print(f"  scanned blocks {mark + 1:,}..{reached:,} ({span_h:.1f}h): {len(rows)} launches, "
           f"{wrote} written, {got} creators resolved, {C.calls()} rpc calls, "
-          f"{C.throttled()} x429, head {latest:,}", flush=True)
+          f"{C.throttled()} x429, head {latest:,}{fee_note}", flush=True)
     return len(rows)
 
 
@@ -421,7 +511,7 @@ def backfill(days):
     total = 0
     for b in range(lo, latest, step):
         top = min(b + step - 1, latest)
-        rows, _, _ = scan(b, top, MAX_CALLS + C.calls(), quotes)
+        rows, _, _, _ = scan(b, top, MAX_CALLS + C.calls(), quotes)
         total += C.sb_write("/rh_launches?on_conflict=mint", rows)
         print(f"  blocks {b:,}..{top:,}: +{len(rows)} launches (total written {total:,}), "
               f"{C.calls()} rpc, {C.throttled()} x429", flush=True)

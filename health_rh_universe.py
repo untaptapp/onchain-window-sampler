@@ -68,7 +68,12 @@ print(f"\n3. rh_pool_fees: {tot:,} rows total, {new:,} written since reference")
 # The failure this exists to catch: launches flowing while fees do not. That is the signature of
 # the fee write erroring out inside its own try/except -- isolated, so nothing breaks and nothing
 # says so except one line in a 5-hour log. Only meaningful once launches have actually moved.
-if post > 200 and new == 0:
+# ...unless the feature is deliberately off, in which case zero fees is the correct state and
+# failing on it would leave a permanently-red line that trains you to ignore this whole check.
+POOL_FEES_ON = os.environ.get("POOL_FEES", "1") not in ("0", "", "false")
+if not POOL_FEES_ON:
+    print("     (POOL_FEES=0 — fee write deliberately disabled, stall check skipped)")
+elif post > 200 and new == 0:
     fail.append(f"pool fees STALLED: {post:,} launches written since reference but 0 fees "
                 "(the fee write is erroring inside its try/except -- read the pass line)")
 # invariants that must hold on EVERY row, checked server-side

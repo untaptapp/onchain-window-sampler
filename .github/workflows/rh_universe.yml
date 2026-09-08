@@ -67,4 +67,6 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          # must match the collector step, or the stall check judges a feature that was off
+          POOL_FEES: '1'
         run: python health_rh_universe.py

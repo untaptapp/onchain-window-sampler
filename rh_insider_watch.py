@@ -146,9 +146,13 @@ def main():
             start = end + 1
 
         # ---- signal detection over the recent hit window (DB-side read, idempotent upsert) ----
+        # Both reads here MUST page (C.sb_all): the plain sbj() read is capped at 1000 rows (A1),
+        # and with order=ts.asc that served only the OLDEST ~2h of the 6h window — every signal
+        # was detected ~4.3h late and its "at detection" quote was ~4h stale (measured 2026-09-08:
+        # lag p50 259 min across 933 signals, vs the ~2 min the pass interval promises).
         now = int(time.time())
-        recent = sbj(f"/rh_insider_touch?dir=eq.in&ts=gte.{now - 6*3600}"
-                     "&select=token,wallet,ts&order=ts.asc")
+        recent = C.sb_all(f"/rh_insider_touch?dir=eq.in&ts=gte.{now - 6*3600}"
+                          "&select=token,wallet,ts&order=ts.asc")
         by_tok = {}
         for h in recent or []:
             by_tok.setdefault(h["token"], []).append((h["ts"], h["wallet"]))
@@ -178,7 +182,8 @@ def main():
                                  "q250_rt_pct": None, "q100_rt_pct": None,
                                  "detected_at": now})
         if sig_rows:
-            have = {(r["token"], r["tier"]) for r in sbj("/rh_insider_signals?select=token,tier")}
+            have = {(r["token"], r["tier"])
+                    for r in C.sb_all("/rh_insider_signals?select=token,tier&order=id.asc")}
             new = [r for r in sig_rows if (r["token"], r["tier"]) not in have]
             for r in new:      # quote at DETECTION — the event-conditioned cost sample
                 r["q250_rt_pct"] = kyber_rt(r["token"], 10**17)      # ~\$250-450 of native

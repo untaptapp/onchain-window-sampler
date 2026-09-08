@@ -57,3 +57,14 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python rh_universe.py --audit
+
+      # Did the v4 fee read (added 2026-09-07) damage the launch firehose? Compares the launch
+      # write rate over the last 6h against the 6h before it, and asserts the pool-fee invariants
+      # on every row. Exits non-zero on a problem, so a degraded firehose turns this workflow RED
+      # instead of showing green while the population at risk quietly stops growing (C5b).
+      - name: health check
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python health_rh_universe.py

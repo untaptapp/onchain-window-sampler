@@ -77,12 +77,18 @@ for n,v in (("dynamic rows carrying a fee",bad_dyn),("dynamic rows without a hoo
     if v: fail.append(f"{v} {n}")
 
 # 4. WORKFLOW — did the run abort (e.g. the selftest SystemExit)?
-runs=gh("/actions/workflows/rh_universe.yml/runs?per_page=5")["workflow_runs"]
-print("\n4. recent rh-universe runs")
+if not TOK:
+    # Running INSIDE the workflow: a run inspecting its own status is circular, and the
+    # collector's own exit code already reports it. Skip rather than fake it.
+    print("\n4. workflow runs: skipped (no GITHUB_KEY)")
+    runs=[]
+else:
+    runs=gh("/actions/workflows/rh_universe.yml/runs?per_page=5")["workflow_runs"]
+if runs: print("\n4. recent rh-universe runs")
 for r in runs[:4]:
     print(f"     {r['id']}  {r['status']:12} {str(r['conclusion']):10} {r['created_at']}  {r['head_sha'][:7]}")
-newest=runs[0]
-if newest["conclusion"] in ("failure",): fail.append(f"newest run {newest['id']} FAILED")
+if runs and runs[0]["conclusion"] == "failure":
+    fail.append(f"newest run {runs[0]['id']} FAILED")
 
 # 5. NEIGHBOURS — the fee read adds 0 RPC calls, but verify the shared-RPC jobs are unaffected.
 print("\n5. collectors sharing the public RPC")

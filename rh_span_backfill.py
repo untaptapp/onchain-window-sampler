@@ -68,9 +68,15 @@ def main():
             continue                                     # no GT pool exists — unresolvable
         active = l > now - 24 * 3600
         todo.append((m, start, hi, active, hi - start))
-    # ACTIVE (trending in the last 24h) mints first — their windows are still growing and they
-    # are the live universe a re-ignition monitor would watch; within a tier, biggest gap first.
-    todo.sort(key=lambda x: (-x[3], -x[4]))
+    # INACTIVE (finished-span) mints first: they are the finite, historical study set the
+    # full-coverage re-ignition re-run is waiting on. Active mints' windows grow ~24 wh/day each
+    # (~11k wh/day across ~470 of them) and regrow forever — serving them first starved the
+    # finished spans completely: total backlog measured GROWING 65.1k -> 70.2k wh over 22h
+    # (2026-09-07) with 44.2k wh of finished spans untouched behind 28.3k of live tails. The
+    # C0h lesson inverted: an uncapped, self-renewing tier at the queue head starves the finite
+    # work. Within a tier, biggest gap first; active tails get the leftovers until a live
+    # re-ignition monitor actually exists to need them.
+    todo.sort(key=lambda x: (x[3], -x[4]))
     print(f"{len(todo):,} mints need span coverage "
           f"({sum(1 for t in todo if t[3])} active, "
           f"{sum(t[4] for t in todo)/3600:,.0f} window-hours)", flush=True)

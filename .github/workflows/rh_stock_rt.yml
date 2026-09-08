@@ -1,0 +1,31 @@
+name: rh-stock-rt
+
+# Round-trip cost logger for tokenized stocks on Robinhood Chain. Kyber quotes are live-only
+# (B3): a dropped interval is permanently un-costable, so this is an unbackfillable feed and
+# uses cancel-in-progress: true (C-CRON) — every cron slot force-restarts a fresh run rather
+# than risking a dropped restart. Self-polls every PASS_INTERVAL inside RUN_SECONDS.
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: rh-stock-rt
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          RUN_SECONDS: '18000'
+          PASS_INTERVAL: '600'
+        run: python rh_stock_rt.py

@@ -49,7 +49,7 @@ def main():
     cov = {r["mint"]: (r["ts_from"], r["ts_to"], r["n_bars"]) for r in
            TB.sb_all("/trending_bar_cov?select=mint,ts_from,ts_to,n_bars&mint=like.0x*")}
     pools = {r["mint"]: r for r in
-             TB.sb_all("/trending_pools?select=mint,ok,pool_address&mint=like.0x*")}
+             TB.sb_all("/trending_pools?select=mint,ok,pool_address,last_fetch_to&mint=like.0x*")}
 
     todo = []
     for m, (f, l) in spans.items():
@@ -61,6 +61,16 @@ def main():
         start = lo
         if c and c[0] is not None and c[0] <= lo + 600:
             start = max(lo, c[1])
+        # Credit the furthest point already REQUESTED (`last_fetch_to`, patched per segment
+        # below), not only the furthest bar received. Coverage's ts_to is the last BAR, so a
+        # token that stopped trading before its window end has an empty tail that a cov-only
+        # start re-requests every run, forever — the same "deficit measured on bars alone never
+        # shrinks" trap trending_bars.deficit() documents. Measured 2026-09-09: 658 mints
+        # visited per 5h run, ~4 runs/day, and the finished-span backlog still GREW 44.2k ->
+        # 57.3k window-hours in 1.3 days; the flip to inactive-first (09-08) could not help
+        # because the demand was phantom.
+        lf = (pools.get(m) or {}).get("last_fetch_to") or 0
+        start = max(start, lf)
         if hi - start < 900:
             continue                                     # nothing meaningful missing
         p = pools.get(m)

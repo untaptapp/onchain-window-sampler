@@ -28,10 +28,26 @@ Exit per spec: last swap in (fill, fill+12 min]; if it is earlier than fill+8 mi
 alternative is recomputable); no swap at all is 'floor'. net_taker = (1+g)(1−f)²(1−slip)−1 as
 registered; net_maker credits the pool fee on entry instead of paying it. slip = 1.5% flat.
 
-Env: SUPABASE_URL, SUPABASE_KEY, SLIP (0.015), LOOKBACK_H (2, hours re-processed behind the
-bookmark), TAPE_START (2026-09-09/23).
+Write-once semantics (2026-09-10 fix): a fill is emitted only once its exit window is on the tape
+(fill_ts <= tape_end − 13 min) AND it lies past the FRONTIER `rh_state.paper_needle_final_ts` of
+the previous pass; the LOOKBACK_H hours before the frontier are loaded as WARM-UP only (they seed
+minute closes, the impl reference and — from the rows already written — the 10-min refractory
+chain). The first version re-emitted a 2-hour overlap each run, and because the refractory chain
+and the impl reference restarted at the window edge, 40% of the overlap rows were never
+reproduced and stayed as orphans. Nothing is rewritten now; a pool's fills are one path.
+
+Every fill carries `swaps_prev_h` (swaps in the pool in the 60 min before the fill — the
+activity gate of the 2026-09-10 spec amendment, >=30, is applied in the SUMMARY and at the read,
+never in the universe) and `tape_gap` (its [fill−60 min, fill+12 min] window touches an
+un-backfilled `shadow_gap` block range — such a fill is scored on an incomplete tape and is
+excluded from the gated summary). Self-polls every PASS_INTERVAL inside RUN_SECONDS; the cron
+is a restart heartbeat (GitHub dropped 4 of 5 hourly slots on 2026-09-10).
+
+Env: SUPABASE_URL, SUPABASE_KEY, SLIP (0.015), LOOKBACK_H (2, warm-up hours before the
+frontier), TAPE_START (2026-09-09/23), RUN_SECONDS (18000), PASS_INTERVAL (1200).
 """
 import gzip, io, json, os, sys, time, urllib.request, datetime as dt
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -56,6 +72,11 @@ TIERS = (0.3, 0.5)
 REFRACTORY = 600
 DRIFT = 0.15
 BUCKET = "shadow-tape"
+GATE_SWAPS = 30          # activity gate (spec amendment 2026-09-10): swaps in the pool in the prior hour
+VOL_H = 24               # trailing window for choosing an 'other' token's top pool (stable across passes)
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "18000"))
+PASS_INTERVAL = int(os.environ.get("PASS_INTERVAL", "1200"))
+BLOCKS_PER_S = 9.0       # fallback for mapping a gap's block range to time (heartbeat: ~536 blocks/min)
 
 
 def sbj(path):
@@ -124,7 +145,7 @@ def hour_of(ts):
     return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%d/%H")
 
 
-def build_universe(now, hours):
+def build_universe(now):
     """pool key -> {base, quote, qidx, fee_ppm, uni, first_seen, kind}.
 
     ONE POOL PER TOKEN — the token's DEEPEST pool — exactly what the frozen spec and the bar
@@ -136,8 +157,8 @@ def build_universe(now, hours):
                  trending_pools.pool_address is a hookless static-fee (<=3%) v4 pool;
       'board_v3' = same but the deepest pool is a 20-byte (ramses v3) address — outside the
                  frozen spec (v4 only), scored for information;
-      'other'  = non-board base tokens: their highest-volume hookless <=3% v4 pool over this
-                 run's hours (shadow_venue_hour), one per token."""
+      'other'  = non-board base tokens: their highest-volume hookless <=3% v4 pool over the
+                 trailing VOL_H hours (shadow_venue_hour), one per token."""
     snaps = BT.sb_keyset(f"source=eq.gmgn_rh&captured_at=gte.{int((now - 14 * 86400) * 1000)}",
                          "mint,captured_at")
     first = {}
@@ -180,9 +201,9 @@ def build_universe(now, hours):
         elif m == c1 and c0 in QUOTES:
             uni[addr] = {"base": m, "quote": c0, "qidx": 0, "fee_ppm": p["fee_ppm"], "uni": tag, "first_seen": first[m], "kind": kind}
     n_board = len(uni)
-    # 'other': highest-volume gated v4 pool per non-board base over this run's hours
+    # 'other': highest-volume gated v4 pool per non-board base over the trailing VOL_H hours
     vol = defaultdict(float)
-    for h in hours:
+    for h in hours_between(hour_of(now - (VOL_H - 1) * 3600), hour_of(now)):
         iso = dt.datetime.strptime(h, "%Y-%m-%d/%H").strftime("%Y-%m-%dT%H:00:00Z")   # '+00:00' decodes to a space in a URL
         for r in C.sb_all(f"/shadow_venue_hour?select=venue,usd_vol&kind=eq.v4&delta_s=eq.3&hour=eq.{iso}&order=venue.asc"):
             vol[r["venue"].lower()] += r["usd_vol"] or 0
@@ -211,8 +232,32 @@ def build_universe(now, hours):
     return uni
 
 
-def simulate(rows, uni, max_ts):
-    """rows: tape swaps of universe pools (any order). Returns finalized fill rows."""
+def gap_windows(rows):
+    """Tape gaps as (t0, t1) epoch windows. `shadow_gap.backfilled` lags the tape (2026-09-10: both
+    'lag > 3000' ranges were flagged false while backfill-<from>-<to>.jsonl.gz files held them), so a
+    range counts as a gap ONLY if the loaded universe rows are empty inside it."""
+    gaps = sbj("/shadow_gap?select=ts,from_blk,to_blk,reason&backfilled=eq.false&order=ts.asc")
+    bt = sorted((r["blk"], r["ts"]) for r in rows)
+    blks = [b for b, _ in bt]
+    out = []
+    for g in gaps:
+        if str(g.get("reason", "")).startswith("NOT a tape gap"):
+            continue
+        i0, i1 = bisect_left(blks, g["from_blk"]), bisect_right(blks, g["to_blk"])
+        if i1 > i0:
+            continue        # the range IS on the tape (backfill-<from>-<to> files): the flag is stale, not the tape
+        t_det = dt.datetime.fromisoformat(g["ts"].replace("Z", "+00:00")).timestamp()
+        t0 = bt[i0 - 1][1] if i0 > 0 else t_det - (g["to_blk"] - g["from_blk"]) / BLOCKS_PER_S
+        t1 = bt[i1][1] if i1 < len(bt) else t_det
+        out.append((t0, t1))
+    return out
+
+
+def simulate(rows, uni, max_ts, final_prev=0.0, seed_last=None, gaps=()):
+    """rows: tape swaps of universe pools (any order), including LOOKBACK_H warm-up hours.
+    Emits only fills with final_prev < fill_ts <= max_ts − 780 (exit window on the tape);
+    everything earlier is warm-up. seed_last: {(pool, mode, tier): last written fill_ts}."""
+    seed_last = seed_last or {}
     by_pool = defaultdict(list)
     for r in rows:
         by_pool[r["key"]].append(r)
@@ -234,10 +279,11 @@ def simulate(rows, uni, max_ts):
             px.append((r["ts"], r["blk"], avg, end, "buy" if aq > 0 else "sell", r.get("usd")))
         if len(px) < 2:
             continue
+        tss = [p[0] for p in px]
         fills = []
         for mode in ("spec", "impl"):
             ref, ref_minute, last_ts_seen, last_rc, n_rc = None, None, None, 0, 0
-            last_fill = {t: -1e12 for t in TIERS}
+            last_fill = {t: seed_last.get((key, mode, t), -1e12) for t in TIERS}
             minute_close = {}
             for ts, blk, avg, end, side, usd in px:
                 m = int(ts // 60)
@@ -264,6 +310,11 @@ def simulate(rows, uni, max_ts):
                         continue
                     if end <= level or avg <= level:
                         last_fill[tier] = ts
+                        if mode == "impl":
+                            ref, last_rc = end, ts   # re-arm below the new price after a fill
+                        if ts <= final_prev:
+                            n_rc = 0
+                            continue                 # warm-up: state only, already written
                         if meta["uni"] == "board" and ts < meta["first_seen"]:
                             uni_tag = "other"         # not yet boarded at fill time
                         else:
@@ -272,10 +323,10 @@ def simulate(rows, uni, max_ts):
                                       "fee_ppm": meta["fee_ppm"], "uni": uni_tag, "mode": mode, "tier": tier,
                                       "fill_ts": ts, "fill_blk": blk, "ref_px": ref, "fill_px": level,
                                       "cross_kind": "avg" if avg <= level else "end",
-                                      "swap_usd": usd, "n_recenters": n_rc if mode == "impl" else None})
+                                      "swap_usd": usd, "n_recenters": n_rc if mode == "impl" else None,
+                                      "swaps_prev_h": bisect_left(tss, ts) - bisect_left(tss, ts - 3600),
+                                      "tape_gap": any(g0 <= ts + 720 and g1 >= ts - 3600 for g0, g1 in gaps)})
                         n_rc = 0
-                        if mode == "impl":
-                            ref, last_rc = end, ts   # re-arm below the new price after a fill
         # exits
         f = meta["fee_ppm"] / 1e6
         for fl in fills:
@@ -307,12 +358,19 @@ def summ_short(rs):
     return f"n={n} win {100*sum(1 for r in s if r>0)/n:.0f}% med {100*s[n//2]:+.1f}% geo25 {geo:+.2f}%"
 
 
-def summarize(fills):
+def summarize(fills, gated=False):
+    """gated=True: only fills with swaps_prev_h >= GATE_SWAPS and no tape gap (the spec amendment's
+    activity gate — the tape-equivalent of 'a GT bar exists'). Both tables print every pass."""
     import math
     def geo(rs, frac):
         return 100 * (math.exp(sum(math.log(max(1 + frac * r, 1e-9)) for r in rs) / len(rs)) - 1)
-    days = max((max(f["fill_ts"] for f in fills) - min(f["fill_ts"] for f in fills)) / 86400, 1e-9) if fills else 1
-    print(f"\n{'uni':<11} {'mode':<5} {'tier':<4} {'n':>5} {'floor%':>6} {'win%':>5} {'med':>7} {'mean':>7} "
+    if gated:
+        fills = [f for f in fills if (f.get("swaps_prev_h") or 0) >= GATE_SWAPS and not f.get("tape_gap")]
+    if not fills:
+        print(f"\n[{'GATED' if gated else 'ALL'}] no fills"); return
+    days = max((max(f["fill_ts"] for f in fills) - min(f["fill_ts"] for f in fills)) / 86400, 1e-9)
+    print(f"\n[{'GATED >=%d swaps prior hour, no tape gap' % GATE_SWAPS if gated else 'ALL (ungated)'}]")
+    print(f"{'uni':<11} {'mode':<5} {'tier':<4} {'n':>5} {'floor%':>6} {'win%':>5} {'med':>7} {'mean':>7} "
           f"{'geo10':>6} {'geo25':>6} {'$/day@100':>9} {'rc/fill':>7}")
     for uset, lab in ((("board",), "board"), (("board_v3",), "board_v3"), (("board", "other"), "board+other")):
         for mode in ("spec", "impl"):
@@ -331,35 +389,59 @@ def summarize(fills):
                       f" | thin@price gross med {100*sorted(alt)[n//2]:+.1f}%")
 
 
-def main():
+def run_pass(uni_cache):
     now = time.time()
-    bm = sbj("/rh_state?key=eq.paper_needle_hour&select=val")
+    st = sbj("/rh_state?key=eq.paper_needle_final_ts&select=val")
+    final_prev = float(st[0]["val"]) if st else 0.0
     start = TAPE_START
-    if bm:
-        t = dt.datetime.strptime(bm[0]["val"], "%Y-%m-%d/%H") - dt.timedelta(hours=LOOKBACK_H)
-        start = max(TAPE_START, t.strftime("%Y-%m-%d/%H"))
+    if final_prev > 0:
+        start = max(TAPE_START, hour_of(final_prev - LOOKBACK_H * 3600))
     end = hour_of(now)
     hours = list(hours_between(start, end))
-    uni = build_universe(now, hours)
+    # universe: rebuilt at most once per hour (board snapshots are a 100k-row read)
+    if uni_cache.get("hour") != end:
+        uni_cache["uni"], uni_cache["hour"] = build_universe(now), end
+    uni = uni_cache["uni"]
     rows = []
     for h in hours:
         hr = load_hour(h, uni)
         rows += hr
         print(f"  {h}: {len(hr)} universe swaps", flush=True)
     if not rows:
-        print("no tape rows in range — nothing to do"); return
+        print("no tape rows in range — nothing to do", flush=True); return
     max_ts = max(r["ts"] for r in rows)
-    fills = simulate(rows, uni, max_ts)
+    frontier = max_ts - 780
+    if frontier <= final_prev:
+        print(f"tape end {hour_of(max_ts)} not past frontier — nothing to finalize", flush=True); return
+    # seed the 10-min refractory chain from what is already written (write-once: never re-derive)
+    seed = {}
+    for r in C.sb_all(f"/paper_needle_fills?select=pool,mode,tier,fill_ts&fill_ts=gt.{final_prev - REFRACTORY}"
+                      f"&fill_ts=lte.{final_prev}&order=fill_ts.asc,pool.asc,mode.asc,tier.asc"):
+        k = (r["pool"], r["mode"], float(r["tier"]))
+        seed[k] = max(seed.get(k, 0), r["fill_ts"])
+    gaps = gap_windows(rows)
+    fills = simulate(rows, uni, max_ts, final_prev, seed, gaps)
     if fills:
         C.sb_write("/paper_needle_fills?on_conflict=pool,uni,mode,tier,fill_ts", fills,
                    prefer="resolution=merge-duplicates,return=minimal")
-    last_final = max((f["fill_ts"] for f in fills), default=None)
-    bookmark = hour_of(min(max_ts - 900, last_final or max_ts))
-    C.sb("POST", "/rh_state?on_conflict=key", [{"key": "paper_needle_hour", "val": bookmark}],
+    C.sb("POST", "/rh_state?on_conflict=key", [{"key": "paper_needle_final_ts", "val": f"{frontier:.3f}"}],
          prefer="resolution=merge-duplicates,return=minimal")
     print(f"pass done: {len(rows)} swaps in {len({r['key'] for r in rows})} pools, {len(fills)} fills finalized "
-          f"(tape to {hour_of(max_ts)}, bookmark {bookmark})", flush=True)
+          f"(tape to {hour_of(max_ts)}, frontier {final_prev:.0f} -> {frontier:.0f}, "
+          f"{len(gaps)} open tape gaps, {sum(1 for f in fills if f['tape_gap'])} fills gap-flagged)", flush=True)
     summarize(fills)
+    summarize(fills, gated=True)
+
+
+def main():
+    t_end = time.time() + RUN_SECONDS
+    uni_cache = {}
+    while True:
+        t0 = time.time()
+        run_pass(uni_cache)
+        if time.time() + PASS_INTERVAL > t_end:
+            break
+        time.sleep(max(0, PASS_INTERVAL - (time.time() - t0)))
 
 
 if __name__ == "__main__":

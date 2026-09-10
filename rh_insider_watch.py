@@ -183,7 +183,7 @@ def main():
                                  "detected_at": now})
         if sig_rows:
             have = {(r["token"], r["tier"])
-                    for r in C.sb_all("/rh_insider_signals?select=token,tier&order=id.asc")}
+                    for r in C.sb_all("/rh_insider_signals?select=token,tier&order=signal_ts.asc,token.asc,tier.asc")}
             new = [r for r in sig_rows if (r["token"], r["tier"]) not in have]
             for r in new:      # quote at DETECTION — the event-conditioned cost sample
                 r["q250_rt_pct"] = kyber_rt(r["token"], 10**17)      # ~\$250-450 of native

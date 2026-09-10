@@ -800,7 +800,15 @@ def main():
                 continue
             p["last_fetch_to"] = int(need_to)
             if not newly:
-                new_attempts.append({"mint": mint, "last_fetch_to": int(need_to)})
+                # Carry the FULL in-memory record, never a bare {mint, last_fetch_to}. A bare
+                # attempt row upserted for a mint with no row on disk INSERTS one with `ok`
+                # defaulting to true and no pool_address — a "phantom" every collector then
+                # treats as resolved and unfetchable. Measured 2026-09-10: 11,138 RH phantoms
+                # (8,882 with bars fetched from the address held only in RAM), ~1,000 new per
+                # day; they were the span backfill's "458 unresolvable" and a permanent
+                # coverage hole for 2,256 mints (497 board). flush_pools groups by key-shape,
+                # so mixed shapes are safe.
+                new_attempts.append(dict(p))
             if len(new_bars) >= 2000:
                 for i in range(0, len(new_bars), 500):
                     sb("POST", "/trending_bars?on_conflict=mint,ts", new_bars[i:i + 500],

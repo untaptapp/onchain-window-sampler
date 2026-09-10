@@ -1,0 +1,30 @@
+name: paper-needle
+
+# Paper book for the needle range-order strategy, replayed hourly against the shadow swap tape
+# (Storage bucket shadow-tape). Idempotent batch (re-processes LOOKBACK_H hours behind its
+# bookmark and upserts on the fill key), so cancel-in-progress is safe and a dropped slot is
+# absorbed by the next. Spec: research/needle-lp-forward-test.md (this book evaluates nothing).
+on:
+  schedule:
+    - cron: '25 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: paper-needle
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          LOOKBACK_H: '2'
+        run: python paper_needle.py

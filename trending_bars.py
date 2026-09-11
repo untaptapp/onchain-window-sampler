@@ -337,6 +337,40 @@ def fetch_bars(pool, need_from, need_to):
     return [got[k] for k in sorted(got)], landed
 
 
+def sb_keyset(filters, select, page=1000, cap=2000000, tries=5):
+    """Page trending_snapshots by `id > last` on the (source, id) index: one index-range scan per
+    page, flat in table size. `filters` excludes select/order/limit. Raises if a page never lands
+    (A-SHORT) and warns loudly at the cap (A5)."""
+    out, last_id = [], None
+    while len(out) < cap:
+        q = f"/trending_snapshots?{filters}&select=id,{select}&order=id.asc&limit={page}"
+        if last_id is not None:
+            q += f"&id=gt.{last_id}"
+        h = {"apikey": KEY, "Authorization": f"Bearer {KEY}"}
+        chunk = None
+        for a in range(tries):
+            try:
+                with urllib.request.urlopen(urllib.request.Request(SB + q, headers=h), timeout=90) as r:
+                    t = r.read(); chunk = json.loads(t) if t else []
+                break
+            except urllib.error.HTTPError as e:
+                if e.code < 500 or a == tries - 1:
+                    raise RuntimeError(f"sb_keyset page after id {last_id}: {e.code} {e.read()[:200]!r}")
+                time.sleep(1.5 * (a + 1))
+            except Exception:
+                if a == tries - 1:
+                    raise
+                time.sleep(1.5 * (a + 1))
+        if chunk is None:
+            raise RuntimeError(f"sb_keyset page after id {last_id} never landed")
+        out += chunk
+        if len(chunk) < page:
+            return out
+        last_id = chunk[-1]["id"]
+    print(f"WARNING sb_keyset hit cap {cap} on {filters} — result is TRUNCATED", flush=True)
+    return out
+
+
 def main():
     t_end = time.time() + RUN_SECONDS if RUN_SECONDS else None
     while True:
@@ -346,8 +380,12 @@ def main():
         # would spend the GT call budget resolving 0x… addresses that can never resolve, and cache
         # each failure as ok=false in trending_pools. An allowlist rather than a denylist so the
         # next chain we add fails closed — invisible to this collector until deliberately included.
-        snaps = sb_all(f"/trending_snapshots?source=in.({SOL_SOURCES})"
-                       "&select=mint,captured_at&order=captured_at.asc,mint.asc")
+        # KEYSET, not Range offsets (2026-09-11): offset paging sorts/skips an ever-growing prefix
+        # on every page, so the last pages of 118k gmgn_rh rows ran past the 90 s socket timeout
+        # whenever the DB was busy (materialize_rh_paths) and the run died at startup — three
+        # consecutive RH runs failed here and the collector was down ~9 h. Same fix as
+        # backtest.sb_keyset; rows arrive in id order, which min/max below do not care about.
+        snaps = sb_keyset(f"source=in.({SOL_SOURCES})", "mint,captured_at")
         first, last, nobs = {}, {}, defaultdict(int)
         for r in snaps:
             m, t = r["mint"], r["captured_at"] / 1000

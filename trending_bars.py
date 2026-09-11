@@ -136,7 +136,7 @@ def wrong_chain(mint):
 UA = {"Accept": "application/json;version=20230302", "User-Agent": "Mozilla/5.0"}
 
 
-def sb(method, path, body=None, prefer=None):
+def sb(method, path, body=None, prefer=None, timeout=60):
     h = {"apikey": KEY, "Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
     if prefer:
         h["Prefer"] = prefer
@@ -144,7 +144,7 @@ def sb(method, path, body=None, prefer=None):
     req = urllib.request.Request(SB + path, data=data, method=method, headers=h)
     for a in range(4):
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 t = r.read()
                 return r.status, (json.loads(t) if t else None)
         except urllib.error.HTTPError as e:
@@ -417,8 +417,26 @@ def main():
         # Which mints get the long post window. Read from the trending_mint_age VIEW, which is the
         # single definition shared with prune_trending_bars — if the collector and the retention job
         # disagreed, one would fetch bars the other immediately deletes, burning GT calls forever.
-        long_post = {r["mint"] for r in sb_all("/trending_mint_age?select=mint,age_s"
-                                               f"&age_s=gte.{LONG_AGE_S}")}
+        # ONE call, ONE scan (2026-09-11): paging the view by Range recomputed the whole 245k-row
+        # group-by (with a jsonb parse per row) on EVERY page, and under IO load a page ran past
+        # the 90 s socket timeout — the run died here right after the snapshots fix. The RPC
+        # aggregates to a single jsonb (no 1000-row cap), filtered to this collector's sources.
+        # If it still fails, degrade LOUDLY to the previous pass's set rather than dying: a pass
+        # with the short window beats no pass (the pruner keeps LONG_POST_H regardless).
+        try:
+            lp = set()
+            for src in SOL_SOURCES.split(","):
+                st, body = sb("POST", "/rpc/trending_long_post_mints",
+                              {"min_age": LONG_AGE_S, "src": src.strip()}, timeout=120)
+                if st != 200:
+                    raise RuntimeError(f"rpc trending_long_post_mints -> {st}: {str(body)[:200]}")
+                lp |= set(body or [])
+            long_post = lp
+        except Exception as e:
+            long_post = globals().get("_LAST_LONG_POST", set())
+            print(f"WARNING long-post set unavailable ({e}); using previous pass's {len(long_post)} mints",
+                  flush=True)
+        globals()["_LAST_LONG_POST"] = long_post
         print(f"long post window ({LONG_POST_H}h): {len(long_post)} mints; "
               f"{POST_H}h for the rest", flush=True)
         pools = {p["mint"]: p for p in

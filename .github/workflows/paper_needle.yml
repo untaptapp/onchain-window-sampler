@@ -1,7 +1,9 @@
 name: paper-needle
 
-# Paper book for the needle range-order strategy, replayed against the shadow swap tape (Storage
-# bucket shadow-tape). Write-once: each pass finalizes only fills past its frontier
+# Paper book for the needle range-order strategy, replayed against the CHAIN swap record
+# (tape_prices.py: every V3/V4 Swap log with its own sqrtPriceX96 and block time, bucket shadow-tape
+# prefix prices/v2/, extended to head at the start of every pass; the shadow tape supplies USD sizes
+# only — guardrail D-PRICE). Write-once: each pass finalizes only fills past its frontier
 # (rh_state.paper_needle_final_ts) and loads LOOKBACK_H warm-up hours for state, so a killed pass
 # loses nothing and cancel-in-progress is safe. Self-polls every PASS_INTERVAL inside RUN_SECONDS;
 # the cron is a restart heartbeat (C2: GitHub dropped 4 of 5 hourly slots on 2026-09-10).
@@ -28,6 +30,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}   # block timestamps (the public node returns 0)
           LOOKBACK_H: '2'
           RUN_SECONDS: '18000'
           PASS_INTERVAL: '1200'

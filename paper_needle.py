@@ -195,7 +195,7 @@ def load_chain(t_from, t_to, uni):
     if not starts:
         raise PricesNotReady("chain swap record is empty: run tape_prices.py")
     sel = [st for st in starts if mk[st]["ts_max"] is not None and mk[st]["ts_max"] >= t_from]
-    if not sel or mk[starts[0]]["ts_min"] > t_from:
+    if not sel or mk[starts[0]]["ts_min"] > t_from + 120:      # the record's first swap lands seconds after its first block
         raise PricesNotReady(f"chain record does not reach back to {hour_of(t_from)}")
     # contiguity over the chunks this pass needs: from the chunk holding t_from until one starts after t_to
     i0 = starts.index(sel[0])
@@ -211,24 +211,48 @@ def load_chain(t_from, t_to, uni):
         raise PricesNotReady(f"chain record is contiguous only to {dt.datetime.fromtimestamp(covered_to, dt.timezone.utc):%m-%d %H:%M} UTC "
                              f"(block {mk[chain[-1]]['to']}), pass needs {dt.datetime.fromtimestamp(t_to, dt.timezone.utc):%m-%d %H:%M}")
     rows = []
+    keep = replay_superset(uni)
     for st in chain:
         m = mk[st]
         if m["ts_min"] is not None and m["ts_min"] > t_to:
             break
-        raw = TP.storage("GET", f"/storage/v1/object/{BUCKET}/{TP.PREFIX}/{st:09d}.jsonl.gz")
-        if raw is None:
-            raise RuntimeError(f"chain record chunk {st}: marker without data")
-        n = 0
-        for line in gzip.GzipFile(fileobj=io.BytesIO(raw)).read().decode().splitlines():
-            if not line:
-                continue
-            n += 1
-            r = json.loads(line)
-            if r["key"] in uni and t_from <= r["ts"] <= t_to:
-                rows.append(r)
-        if n != m["rows"]:
-            raise RuntimeError(f"chain record chunk {st}: {n} rows, marker says {m['rows']}")
+        ck = (st, m["to"])
+        if ck in _CHAIN_CACHE:
+            part = _CHAIN_CACHE[ck]
+        else:
+            raw = TP.storage("GET", f"/storage/v1/object/{BUCKET}/{TP.PREFIX}/{st:09d}.jsonl.gz")
+            if raw is None:
+                raise RuntimeError(f"chain record chunk {st}: marker without data")
+            n, part = 0, []
+            for line in gzip.GzipFile(fileobj=io.BytesIO(raw)).read().decode().splitlines():
+                if not line:
+                    continue
+                n += 1
+                r = json.loads(line)
+                if r["key"] in keep:
+                    part.append(r)
+            if n != m["rows"]:
+                raise RuntimeError(f"chain record chunk {st}: {n} rows, marker says {m['rows']}")
+            if REPLAY:
+                _CHAIN_CACHE[ck] = part
+        rows += [dict(r) for r in part if r["key"] in uni and t_from <= r["ts"] <= t_to]
+    if REPLAY:                                   # drop chunks that no later pass can need
+        for k in [k for k in _CHAIN_CACHE if mk.get(k[0], {}).get("ts_max", 0) < t_from - 3600]:
+            del _CHAIN_CACHE[k]
     return rows, min(covered_to, t_to)
+
+
+_CHAIN_CACHE, _TAPE_CACHE = {}, {}
+
+
+def replay_superset(uni):
+    """Pool keys any universe of this run can contain. Live passes filter to `uni` itself; a replay caches
+    parsed chunks across passes, so it filters to the superset (every gated V4 pool + every board mint's
+    deepest pool) or a pool entering the universe later would silently lack its rows."""
+    if not REPLAY or "v4pools" not in _UCACHE:
+        return set(uni)
+    return (set(uni) | {p["key"].lower() for p in _UCACHE["v4pools"]}
+            | {a for a, _ in _UCACHE.get("deep", {}).values()})
 
 
 def attach_usd(rows, uni, t_from, t_to):
@@ -236,15 +260,26 @@ def attach_usd(rows, uni, t_from, t_to):
     VERIFIED on amounts), else estimated from the same hour's tape USD-per-raw-quote-unit for that quote
     token (`usd_src` = 'est'), else None. USD is used only for reporting and the capacity cap."""
     tape, rate = {}, defaultdict(list)
+    keep = replay_superset(uni)
     for h in hours_between(hour_of(t_from), hour_of(t_to + 3600)):
-        for r in load_hour(h, uni):
-            if r.get("usd") is None:
+        if h in _TAPE_CACHE and h < hour_of(time.time() - 7200):     # an hour 2 h+ old no longer changes
+            hr = _TAPE_CACHE[h]
+        else:
+            hr = [{"blk": r["blk"], "li": r["li"], "key": r["key"], "a0": r["a0"], "a1": r["a1"], "ts": r["ts"], "usd": r["usd"]}
+                  for r in load_hour(h, keep) if r.get("usd") is not None]
+            if REPLAY:
+                _TAPE_CACHE[h] = hr
+        for r in hr:
+            if r["key"] not in uni:
                 continue
             tape[(r["blk"], r["li"])] = r
             m = uni[r["key"]]
             aq = int(r["a0"]) if m["qidx"] == 0 else int(r["a1"])
             if aq:
                 rate[(m["quote"], hour_of(r["ts"]))].append(r["usd"] / abs(aq))
+    if REPLAY:
+        for k in [k for k in _TAPE_CACHE if k < hour_of(t_from - 3600)]:
+            del _TAPE_CACHE[k]
     med = {k: sorted(v)[len(v) // 2] for k, v in rate.items() if len(v) >= 5}
     st = {"tape": 0, "est": 0, "none": 0}
     for r in rows:
@@ -572,8 +607,8 @@ def run_pass(uni_cache, now=None):
     uni = uni_cache["uni"]
     if not REPLAY:
         TP.run()                      # extend the chain record to head − SAFETY before reading it
-    t_from = (final_prev - LOOKBACK_H * 3600) if final_prev > 0 else \
-        dt.datetime.strptime(TAPE_START, "%Y-%m-%d/%H").replace(tzinfo=dt.timezone.utc).timestamp()
+    tape_start = dt.datetime.strptime(TAPE_START, "%Y-%m-%d/%H").replace(tzinfo=dt.timezone.utc).timestamp()
+    t_from = max(tape_start, final_prev - LOOKBACK_H * 3600) if final_prev > 0 else tape_start   # warm-up never before the record
     rows, covered_to = load_chain(t_from, now, uni)
     us = attach_usd(rows, uni, t_from, covered_to)
     print(f"  chain swaps {len(rows)} in {len({r['key'] for r in rows})} pools, {hour_of(t_from)} -> "

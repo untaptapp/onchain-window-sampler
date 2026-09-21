@@ -399,8 +399,23 @@ def build_universe(now):
             vol[r["venue"].lower()] += r["usd_vol"] or 0
     best = {}
     if "v4pools" not in _UCACHE or not REPLAY:
-        _UCACHE["v4pools"] = C.sb_all(f"/shadow_pool?select=key,token0,token1,fee_ppm,hooks&kind=eq.v4"
-                                      f"&hooks=eq.{ZERO}&fee_ppm=lte.{FEE_MAX}&order=key.asc")
+        # keyset-paged (A-OFFSET: offset pages over the 300k-row registry time out under DB load and killed every
+        # pass 09-20 -> 09-21), and a failure DEGRADES LOUDLY to the board universe instead of killing the pass (A-VIEW)
+        try:
+            rows, last = [], ""
+            while True:
+                st, page = C.sb("GET", f"/shadow_pool?select=key,token0,token1,fee_ppm,hooks&kind=eq.v4&hooks=eq.{ZERO}"
+                                       f"&fee_ppm=lte.{FEE_MAX}&key=gt.{last}&order=key.asc&limit=1000")
+                if not (200 <= st < 300):
+                    raise RuntimeError(f"shadow_pool page after {last[:12]}: {st} {str(page)[:120]}")
+                rows += page
+                if len(page) < 1000:
+                    break
+                last = page[-1]["key"]
+            _UCACHE["v4pools"] = rows
+        except Exception as e:
+            print(f"WARNING: 'other' universe unavailable this pass ({e}); scoring board pools only", flush=True)
+            _UCACHE["v4pools"] = _UCACHE.get("v4pools", [])
     for p in _UCACHE["v4pools"]:
         k = p["key"].lower()
         if k in uni or k not in vol:

@@ -53,6 +53,18 @@ def bucket(m):
     return None
 
 
+AGEB = [(0, 600, "<10m"), (600, 3600, "10-60m"), (3600, 21600, "1-6h"), (21600, 1e12, ">6h")]
+
+
+def ageband(a):
+    if a is None or a < 0:
+        return "unk"
+    for lo, hi, n in AGEB:
+        if lo <= a < hi:
+            return n
+    return "unk"
+
+
 def wilson(k, n, z=1.96):
     if n == 0:
         return (None, None)
@@ -136,16 +148,21 @@ def main():
     with psycopg.connect(PG_DSN, connect_timeout=20) as c:
         c.execute("set statement_timeout='300s'")
         ev = c.execute("""select event_id, token, payment_ts, created_at, channel, population, pair_age_s, mcap_usd, tape_status,
-                                 buys_60, wallets_60, sol_in_60, clusters_60, tipped_60, marker_60
+                                 buys_60, wallets_60, sol_in_60, clusters_60, tipped_60, marker_60, dex_id, amount, n_prior_boosts, profile_paid_ts
                           from boost_events where kind='boost' and chain='solana' and bars_status='done'""").fetchall()
         cols = ["event_id", "token", "payment_ts", "created_at", "channel", "population", "pair_age_s", "mcap_snap", "tape_status",
-                "buys_60", "wallets_60", "sol_in_60", "clusters_60", "tipped_60", "marker_60"]
+                "buys_60", "wallets_60", "sol_in_60", "clusters_60", "tipped_60", "marker_60", "dex_id", "amount", "n_prior_boosts", "profile_paid_ts"]
         ev = [dict(zip(cols, r)) for r in ev]
         bars = collections.defaultdict(lambda: {"m": [], "h": [], "pool": None})
         for eid, pool, res, ts, o, h, l, cl, v in c.execute(
                 "select b.event_id, b.pool, b.res, b.ts, b.o, b.h, b.l, b.c, b.v from boost_bars b join boost_events e on e.event_id=b.event_id "
                 "where e.kind='boost' and e.chain='solana' order by b.event_id, b.res, b.ts"):
             bars[eid][res].append((ts, o, h, l, cl, v)); bars[eid]["pool"] = pool
+        trades = collections.defaultdict(list)
+        for eid, ts, slot, wallet, side, sol_amt, tip, marker in c.execute(
+                "select t.event_id, t.ts, t.slot, t.wallet, t.side, t.sol_amt, t.tip, t.marker from boost_trades t join boost_events e on e.event_id=t.event_id "
+                "where e.kind='boost' and e.chain='solana'"):
+            trades[eid].append((ts, slot, wallet, side, sol_amt or 0, tip or 0, marker))
         boosted_tokens = {r[0] for r in c.execute("select distinct token from boost_events")}
         # control: pump.fun launches with minute bars, not in boost_events
         ctrl_mints = [r[0] for r in c.execute(
@@ -184,6 +201,11 @@ def main():
 
         m = sorted(b["m"]); hbars = sorted(b["h"])
         pre = [x for x in m if x[0] + 60 <= P + 1 and x[0] >= P - 1800]   # minute bars that CLOSED by P
+        pre_src = "minute"
+        if not pre and e["token"].endswith("pump") and (e.get("dex_id") or "").startswith("pumpfun"):
+            # bonding curve: liquidity cannot be withdrawn, so the last trade price IS the price (no D-LIQ risk)
+            pre = [x for x in hbars if x[0] + 3600 <= P + 1]
+            pre_src = "hour_curve"
         if not pre:
             drop["pre_src_none"] += 1; continue
         pre_mc = mc(pre[-1][4], P)
@@ -191,7 +213,8 @@ def main():
             drop["pre_mc_none"] += 1; continue
         fetched = e["created_at"] or 0
         last_h = hbars[-1][0] + 3600 if hbars else 0
-        out = {"pre_mc": pre_mc, "bucket": bucket(pre_mc), "P": P, "e": e}
+        age = e["pair_age_s"]
+        out = {"pre_mc": pre_mc, "bucket": bucket(pre_mc), "P": P, "e": e, "pre_src": pre_src, "age": age, "ageb": ageband(age)}
         for hn, H in HZ:
             if not (P + H <= fetched or last_h >= P + H):
                 out[hn] = None; continue
@@ -207,14 +230,18 @@ def main():
         if len(bs) < 3:
             continue
         cov = ctrl_cov.get(mnt) or bs[-1][0]
+        birth = ctrl_birth.get(mnt)
+        if birth is None:
+            continue
         for lo, hi, name in BUCKETS[:4]:
-            first = next((x for x in bs if lo <= x[4] * 1e9 < hi), None)
+          for alo, ahi, aname in AGEB:
+            first = next((x for x in bs if lo <= x[4] * 1e9 < hi and alo <= x[0] + 60 - birth < ahi), None)
             if not first:
                 continue
             t = first[0] + 60
-            o = {"pre_mc": first[4] * 1e9, "bucket": name, "age": t - ctrl_birth.get(mnt, t)}
+            o = {"pre_mc": first[4] * 1e9, "bucket": name, "age": t - birth, "ageb": aname}
             for hn, H in HZ:
-                if cov < t + H:
+                if cov < t + H or H > 10800:   # >3h control coverage exists only for tokens that later trended (D-COND)
                     o[hn] = None; continue
                 seg = [x for x in bs if t < x[0] + 60 <= t + H]
                 o[hn] = (max([x[4] * 1e9 for x in seg] or [o["pre_mc"]]), max([x[2] * 1e9 for x in seg] or [o["pre_mc"]]))
@@ -233,6 +260,19 @@ def main():
                     k = sum(1 for o in g if f(o, o[hn][0])); kh = sum(1 for o in g if f(o, o[hn][1]))
                     lo_, hi_ = wilson(k, len(g))
                     print(f"   {bn:8s} {hn:4s} {arm} n {len(g):5d}  hit {pct(k/len(g))}  CI [{pct(lo_)},{pct(hi_)}]  [high {pct(kh/len(g))}]")
+    print("\n== AGE-MATCHED touch rates (control restricted to the same age band; horizons <=3h)")
+    for target_name, f in (("abs $20k", lambda o, v: v >= 2e4), ("2x pre", lambda o, v: v >= 2 * o["pre_mc"])):
+        for _, _, bn in BUCKETS[:4]:
+            for _, _, an in AGEB:
+                for hn in ("1h", "3h"):
+                    gb = [o for o in rows if o["bucket"] == bn and o["ageb"] == an and o.get(hn) is not None]
+                    gc = [o for o in ctrl if o["bucket"] == bn and o["ageb"] == an and o.get(hn) is not None]
+                    if len(gb) < 3:
+                        continue
+                    kb = sum(1 for o in gb if f(o, o[hn][0])); kc = sum(1 for o in gc if f(o, o[hn][0]))
+                    lb, hb_ = wilson(kb, len(gb)); lc, hc = wilson(kc, len(gc)) if gc else (None, None)
+                    print(f"   {target_name:8s} {bn:8s} age {an:6s} {hn:3s}  BOOST {kb:3d}/{len(gb):3d} {pct(kb/len(gb))} [{pct(lb)},{pct(hb_)}]   "
+                          f"CTRL {kc:4d}/{len(gc):4d} {pct(kc/len(gc) if gc else None)} [{pct(lc)},{pct(hc)}]")
     ages = {bn: (statistics.median([o["e"]["pair_age_s"] for o in rows if o["bucket"] == bn and o["e"]["pair_age_s"] is not None] or [float('nan')]),
                  statistics.median([o["age"] for o in ctrl if o["bucket"] == bn] or [float('nan')])) for _, _, bn in BUCKETS[:4]}
     print("  median age at signal (s): boost / control:", {k: (round(a), round(b)) if a == a and b == b else (a, b) for k, (a, b) in ages.items()})
@@ -287,6 +327,81 @@ def main():
             xs = [r for r in (sim(o, 60, 2e4, None, 86400) for o in part) if r is not None]
             if xs:
                 print(f"  <10k TP $20k/24h L=60 {nm:12s} {stats(xs)}")
+
+    # ------------------------------------------------------------ profiles: what the first 30 s of tape looks like, and what follows
+    print("\n== PROFILES — tape in the first 30 s after payment (taped boosts only); outcome from entry at L=60 s (after the profile is observable)")
+    def prof(o):
+        tr = [x for x in trades.get(o["e"]["event_id"], []) if 0 <= x[0] - o["P"] <= 30]
+        buys = [x for x in tr if x[3] == "buy" and x[4] >= 0.01]
+        w = len({x[2] for x in buys}); sol_in = sum(x[4] for x in buys); sol_out = sum(x[4] for x in tr if x[3] == "sell")
+        slots = collections.Counter(x[1] for x in buys)
+        same_slot = max(slots.values()) if slots else 0
+        name = "quiet" if w == 0 else ("trickle 1-4" if w < 5 else ("crowd 5-19" if w < 20 else "wave 20+"))
+        return name, dict(w=w, sol_in=sol_in, sol_out=sol_out, same_slot=same_slot, tipped=sum(1 for x in buys if x[5] > 0))
+    taped = [o for o in rows if o["e"]["tape_status"] == "done"]
+    print(f"  taped boosts with bars and pre-mcap: {len(taped)}")
+    groups = collections.defaultdict(list)
+    for o in taped:
+        n, feat = prof(o); o["prof"] = n; o["feat"] = feat; groups[n].append(o)
+    for n in ("quiet", "trickle 1-4", "crowd 5-19", "wave 20+"):
+        g = groups.get(n, [])
+        if not g:
+            print(f"   {n:12s} n   0"); continue
+        h1 = [o for o in g if o.get("1h") is not None]
+        k20 = sum(1 for o in h1 if o["1h"][0] >= 2e4); k2x = sum(1 for o in h1 if o["1h"][0] >= 2 * o["pre_mc"])
+        xs = [r for r in (sim(o, 60, None, None, 3600) for o in g) if r is not None]
+        xs2 = [r for r in (sim(o, 60, 2.0, 0.5, 21600) for o in g) if r is not None]
+        print(f"   {n:12s} n {len(g):3d}  pre-mcap p50 ${statistics.median(o['pre_mc'] for o in g):,.0f}  reach $20k/1h {k20}/{len(h1)}  2x/1h {k2x}/{len(h1)}")
+        if len(xs) >= 3:
+            print(f"      hold 1h from L=60   {stats(xs)}")
+        if len(xs2) >= 3:
+            print(f"      TP2x SL50 6h L=60   {stats(xs2)}")
+
+    # ------------------------------------------------------------ filter search with a time holdout (D4/D6/D7)
+    print("\n== FILTER SEARCH — every slice x rule at L=60 s; choose on the EARLIER half (by payment time), report the frozen choice on the LATER half")
+    RULES = [("hold 15m", None, None, 900), ("hold 1h", None, None, 3600), ("hold 6h", None, None, 21600),
+             ("TP 2x / 6h", 2.0, None, 21600), ("TP 2x SL 50% / 6h", 2.0, 0.5, 21600), ("TP $20k / 24h", 2e4, None, 86400),
+             ("TP 3x SL 50% / 24h", 3.0, 0.5, 86400)]
+    def feats(o):
+        e = o["e"]
+        f = {"bucket": o["bucket"], "age": o["ageb"], "tier": f"x{e['amount']}",
+             "venue": "curve" if (e.get("dex_id") or "").startswith("pumpfun") else "amm",
+             "prior_boost": "yes" if (e.get("n_prior_boosts") or 0) > 0 else "no",
+             "profile_before": "yes" if (e.get("profile_paid_ts") and e["profile_paid_ts"] <= e["payment_ts"]) else "no"}
+        if o.get("prof"):
+            f["tape"] = o["prof"]
+        return f
+    for o in rows:
+        o["f"] = feats(o)
+        o["res"] = {rn: sim(o, 60, tp, sl, H) for rn, tp, sl, H in RULES}
+    srt = sorted(rows, key=lambda o: o["P"])
+    cut = srt[len(srt) // 2]["P"] if srt else 0
+    train = [o for o in srt if o["P"] < cut]; test = [o for o in srt if o["P"] >= cut]
+    slices = [("all", None)] + sorted({(k, v) for o in rows for k, v in o["f"].items()})
+    def cell(data, sl_, rn):
+        g = data if sl_[0] == "all" else [o for o in data if o["f"].get(sl_[0]) == sl_[1]]
+        xs = [o["res"][rn] for o in g if o["res"][rn] is not None]
+        return xs
+    def geo(xs):
+        net = [(1 + x) * (1 - COST_RT) - 1 for x in xs]
+        return sum(math.log(max(1e-9, 1 + FRAC * x)) for x in net) / len(net)
+    MIN_CELL = int(os.environ.get("MIN_CELL", "20"))
+    cands = []
+    for sl_ in slices:
+        for rn, *_ in RULES:
+            xs = cell(train, sl_, rn)
+            if len(xs) >= MIN_CELL:
+                cands.append((geo(xs), sl_, rn, len(xs)))
+    cands.sort(reverse=True)
+    print(f"  events: train {len(train)} / holdout {len(test)}; candidate cells with n>={MIN_CELL} on train: {len(cands)}")
+    for g_, sl_, rn, n_ in cands[:8]:
+        ht = cell(test, sl_, rn)
+        print(f"   TRAIN geo {100*g_:+6.2f}%/trade n {n_:3d}  {sl_[0]}={sl_[1]:<12s} {rn:20s} | HOLDOUT " + (stats(ht) if len(ht) >= 3 else f"n {len(ht)} (too few)"))
+    if cands:
+        g_, sl_, rn, n_ = cands[0]
+        ht = cell(test, sl_, rn)
+        print(f"  FROZEN CHOICE {sl_[0]}={sl_[1]} / {rn}: holdout " + (stats(ht) if ht else "n 0"))
+        print(f"  (tried {len(cands)} cells; with that many tries the best TRAIN cell is expected to look good by chance — only the holdout counts)")
 
     # ------------------------------------------------------------ kontract, reported separately
     print("\n== kontract (excluded above): pre $3.6k at the boost (tape), +40 s $13k, +5 min $24k peak, +40 min $18k — the hypothesis source")

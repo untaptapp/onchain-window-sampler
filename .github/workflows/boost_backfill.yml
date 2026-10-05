@@ -32,6 +32,8 @@ jobs:
           SHARD: ${{ github.event.inputs.shard }}
           POPULATIONS: ${{ github.event.inputs.populations }}
           RUN_SECONDS: '20700'
+          SAMPLE_PUMP: '100000'
+          SAMPLE_UNIVERSE: '100000'
           ORDERS_RPM: '57'
           HELIUS_BUDGET: '4000'
         run: python boost_backfill.py

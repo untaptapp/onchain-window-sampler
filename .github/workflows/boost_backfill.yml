@@ -1,0 +1,37 @@
+name: boost-backfill
+
+# One-off retrospective scan for DexScreener paid orders (research/dex-paid-signal.md), sharded so two
+# IPs share DexScreener's 60/min orders limit. Dispatch with shard "1/2" while a local run does "0/2".
+# Resumable: tokens already in boost_events are skipped.
+on:
+  workflow_dispatch:
+    inputs:
+      shard: {description: 'i/n', default: '1/2'}
+      populations: {description: 'comma list', default: 'bar_universe'}
+
+concurrency:
+  group: boost-backfill-${{ github.event.inputs.shard }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: deps
+        run: pip install --quiet websockets
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          HELIUS_KEY: ${{ secrets.HELIUS_KEY }}
+          SHARD: ${{ github.event.inputs.shard }}
+          POPULATIONS: ${{ github.event.inputs.populations }}
+          RUN_SECONDS: '20700'
+          ORDERS_RPM: '57'
+          HELIUS_BUDGET: '4000'
+        run: python boost_backfill.py

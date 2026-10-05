@@ -26,7 +26,8 @@ import os, sys, time, json, random, math, collections, urllib.parse
 os.environ.setdefault("SINK", "supabase")
 import boost_tape as bt   # reuses http_json, sb, Sink, tx_to_legs, summarise, Event, templates, TIP_ACCOUNTS
 
-SAMPLE = {"recent_board": int(os.environ.get("SAMPLE_RECENT", "2000")), "pump_launch": int(os.environ.get("SAMPLE_PUMP", "3000")),
+SHARD = os.environ.get("SHARD", "0/1")   # "i/n": keep mints with crc32(mint) % n == i (split the scan across IPs)
+SAMPLE = {"bar_universe": int(os.environ.get("SAMPLE_UNIVERSE", "100000")), "recent_board": int(os.environ.get("SAMPLE_RECENT", "2000")), "pump_launch": int(os.environ.get("SAMPLE_PUMP", "3000")),
           "trending": int(os.environ.get("SAMPLE_TRENDING", "1500")),
           "rh_launch": int(os.environ.get("SAMPLE_RH", "1000"))}
 POPULATIONS = [p for p in os.environ.get("POPULATIONS", "pump_launch,trending,rh_launch").split(",") if p]
@@ -34,7 +35,7 @@ SIG_PAGES = int(os.environ.get("SIG_PAGES", "30"))
 TAPE_MAX_AGE_D = float(os.environ.get("TAPE_MAX_AGE_D", "7"))   # older events: recorded, no tape (each too_deep burns SIG_PAGES calls)
 ORDERS_RPM = int(os.environ.get("ORDERS_RPM", "55"))
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "20000"))
-CHAIN_OF = {"pump_launch": "solana", "trending": "solana", "rh_launch": "robinhood", "recent_board": "solana"}
+CHAIN_OF = {"bar_universe": "solana", "pump_launch": "solana", "trending": "solana", "rh_launch": "robinhood", "recent_board": "solana"}
 T_END = time.time() + RUN_SECONDS
 log = bt.log
 
@@ -68,6 +69,10 @@ def pg_sample(sql):
 
 
 def population(name):
+    if name == "bar_universe":   # every Solana mint with minute bars (board cases + launch controls), keyset-paged
+        rows = sb_keyset("trending_bar_cov", "mint", "&mint=not.like.0x*")
+        pools = {}
+        return [(r["mint"], None, None) for r in rows]
     if PG_DSN:
         n = SAMPLE[name] * 2
         if name == "pump_launch":
@@ -172,7 +177,9 @@ def tape_for(ev):
 def scan(pop, items, known):
     chain = CHAIN_OF[pop]
     random.seed(20261005)
-    items = [it for it in items if it[0] not in known]
+    import zlib
+    si, sn = (int(x) for x in SHARD.split("/"))
+    items = [it for it in items if it[0] not in known and zlib.crc32(it[0].encode()) % sn == si]
     if len(items) > SAMPLE[pop]:
         items = random.sample(items, SAMPLE[pop])
     log(f"{pop}: scanning {len(items)} tokens on {chain} (orders at {ORDERS_RPM}/min ≈ {len(items) / ORDERS_RPM:.0f} min)")

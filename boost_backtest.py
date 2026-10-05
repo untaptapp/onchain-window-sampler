@@ -36,12 +36,18 @@ def sb_get(path):
 def keyset(table, select, key, extra=""):
     out, last = [], None
     while True:
-        q = f"/{table}?select={select}&order={key}.asc&limit=1000{extra}" + (f"&{key}=gt.{urllib.parse.quote(str(last))}" if last is not None else "")
+        k0 = key.split(",")[0]
+        order = ",".join(f"{k}.asc" for k in key.split(","))
+        q = f"/{table}?select={select}&order={order}&limit=1000{extra}" + (f"&{k0}=gt.{urllib.parse.quote(str(last))}" if last is not None else "")
         rows = sb_get(q)
         out += rows
         if len(rows) < 1000:
             return out
-        last = rows[-1][key.split(",")[0]]
+        last = rows[-1][k0]
+        if len(key.split(",")) > 1:
+            # composite key: pull the remainder of the last event_id in full, then continue strictly after it
+            tail = sb_get(f"/{table}?select={select}&order={order}&{k0}=eq.{urllib.parse.quote(str(last))}&limit=5000")
+            out = [r for r in out if r[k0] != last] + tail
 
 
 def q(xs, p):
@@ -78,6 +84,12 @@ def main():
                 g = [e for e in tape if e["kind"] == kind]
                 if g:
                     print(f"  {name:44s} {kind:8s} {100*sum(1 for e in g if f(e))/len(g):5.1f}%  (n {len(g)})")
+        print("\n== Q1b activity LIFT: buys in the first 60 s vs the per-minute rate in the 120 s before payment (busy tokens look 'fast' without any trigger)")
+        for kind in ("boost", "profile"):
+            g = [e for e in tape if e["kind"] == kind]
+            quiet = [e for e in g if (e["pre_trades"] or 0) == 0]
+            print(f"  {kind:8s} n {len(g):4d}  quiet-before (0 pre trades) {len(quiet):4d}; of those with >=5 buys in 60 s: {sum(1 for e in quiet if (e['buys_60'] or 0) >= 5):4d}  "
+                  f"| busy-before median buys_60/(pre/2): {fmt(q([(e['buys_60'] or 0) / max(0.5, (e['pre_trades'] or 0) / 2) for e in g if (e['pre_trades'] or 0) > 0], .5), 2)}")
         print("\n== Q2 latency (s after paymentTimestamp; block time is 1-s resolution)")
         for kind in ("boost", "profile"):
             g = [e for e in tape if e["kind"] == kind and (e["buys_60"] or 0) > 0]

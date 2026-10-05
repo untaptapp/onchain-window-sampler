@@ -283,12 +283,24 @@ async def handle_item(item, channel, seen_at):
         STATS["event_dropped_no_orders"] += 1
         SEEN_ITEMS.discard(key)   # allow the REST fallback to retry it
         return
-    boosts = [b for b in orders.get("boosts", []) if b.get("amount") == amount] or orders.get("boosts", [])
-    if not boosts:
-        STATS["event_no_boost_record"] += 1
-        log("feed item without a boost record in orders/v1", token, amount)
+    # orders/v1 sits behind a 60-s cache: the boost we just saw may not be in it yet, and binding to the
+    # token's PREVIOUS boost (months old) corrupts event_id, our_lag and the tape window. Require a boost
+    # paid within FRESH_S of seen_at for live channels; otherwise wait and re-fetch, then give up loudly.
+    FRESH_S = 900
+    pay = None
+    for attempt in range(6):
+        boosts = [b for b in orders.get("boosts", []) if b.get("amount") == amount] or orders.get("boosts", [])
+        recent = [b["paymentTimestamp"] for b in boosts if seen_at - FRESH_S <= b["paymentTimestamp"] / 1000 <= seen_at + 60]
+        if recent:
+            pay = max(recent)
+            break
+        await asyncio.sleep(15)
+        orders = await loop.run_in_executor(None, ds_orders, chain, token) or orders
+    if pay is None:
+        STATS["event_no_fresh_boost"] += 1
+        log("no boost within FRESH_S of seen_at after 6 tries; item dropped", chain, token, amount,
+            "newest", max([b["paymentTimestamp"] for b in orders.get("boosts", [])], default=None))
         return
-    pay = max(b["paymentTimestamp"] for b in boosts)
     event_id = f"{chain}:{token}:{pay}" if chain != "solana" else f"{token}:{pay}"
     if event_id in EVENTS or event_id in KNOWN_IDS:
         STATS["dup_event"] += 1

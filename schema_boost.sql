@@ -15,7 +15,7 @@ create table if not exists boost_events (
   channel           text not null,               -- 'ws' | 'rest' (rest = 60-s cached mirror; never pool lags)
   seen_at           bigint not null,             -- ms, when OUR process saw the item
   payment_ts        bigint not null,             -- ms, DexScreener's paymentTimestamp
-  our_lag_ms        integer,                     -- seen_at - payment_ts
+  our_lag_ms        bigint,                      -- seen_at - payment_ts (bigint: a stale binding once overflowed int4)
   pair_address      text,                        -- deepest pair at seen_at (DexScreener)
   dex_id            text,
   pair_created_at   bigint,                      -- ms

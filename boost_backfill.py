@@ -220,8 +220,8 @@ def scan(pop, items, known):
                     ev.tape_status = "too_old"
                     row["tape_status"] = "too_old"
                 legs = tape_for(ev) if ev.tape_status == "pending" else []
+                bt.SINK_OBJ.write("boost_events", [row], "event_id")          # parent first: boost_trades has an FK to it
                 bt.SINK_OBJ.write("boost_trades", legs, "event_id,sig,wallet,side")
-                bt.SINK_OBJ.write("boost_events", [row], "event_id")
                 n_ev += 1
                 r = row
                 log(f"{pop} {kind} {token[:10]} pay {pay} tape {r['tape_status']} first_buy_lag {r['first_buy_lag_s']} "
@@ -231,6 +231,35 @@ def scan(pop, items, known):
         time.sleep(max(0.0, 60.0 / ORDERS_RPM - (time.time() - t0)))
     log(f"{pop} DONE tokens {len(items)} hits {n_tok_hit} events {n_ev}")
 
+
+def repair_trades():
+    """Re-tape backfilled Solana events whose tape is 'done' but which have no trade rows (the FK-order bug)."""
+    st, evs = bt.sb("GET", "/boost_events?select=event_id,chain,token,amount,payment_ts,pair_address,dex_id,buys_60"
+                           "&channel=eq.backfill&tape_status=eq.done&chain=eq.solana&order=event_id.asc&limit=1000")
+    if st != 200:
+        raise RuntimeError(f"read failed {st} {evs}")
+    st2, have = bt.sb("GET", "/boost_trades?select=event_id&order=event_id.asc&limit=1000")
+    have_ids = {r["event_id"] for r in (have or [])} if st2 == 200 else set()
+    todo = [e for e in evs if e["event_id"] not in have_ids and (e["buys_60"] or 0) + 0 >= 0]
+    log(f"repair: {len(evs)} done tapes, {len(todo)} without trades")
+    for e in todo:
+        if time.time() > T_END or bt.helius_calls >= bt.HELIUS_BUDGET:
+            log("repair stopped: budget/time"); break
+        ev = bt.Event(event_id=e["event_id"], chain="solana", token=e["token"], amount=e["amount"], total=None, channel="backfill",
+                      seen_at=e["payment_ts"] / 1000, payment_ts=e["payment_ts"], pair=e["pair_address"], dex=e["dex_id"],
+                      tape_status="pending", followups_done=set(), row=bt.event_row_template())
+        ev.row.update(event_id=e["event_id"], chain="solana", token=e["token"], payment_ts=e["payment_ts"])
+        legs = tape_for(ev)
+        if ev.row["tape_status"] == "done":
+            ok = bt.SINK_OBJ.write("boost_trades", legs, "event_id,sig,wallet,side")
+            log(f"repair {e['token'][:10]} legs {len(legs)} ok {ok} helius {bt.helius_calls}")
+        else:
+            log(f"repair {e['token'][:10]} -> {ev.row['tape_status']}")
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--repair-trades":
+    repair_trades()
+    raise SystemExit(0)
 
 if __name__ == "__main__":
     known = known_tokens()

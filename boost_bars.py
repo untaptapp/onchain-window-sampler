@@ -59,10 +59,13 @@ def gt(path):
                 continue
             if e.code == 404:
                 return {"_404": True}
+            if e.code == 401:                      # public API serves only the last 180 days
+                return {"_401": True}
             return None
         except Exception:
             time.sleep(5)
-    return None
+    STATS["gt_throttled"] = STATS.get("gt_throttled", 0) + 1
+    return {"_429": True}                          # a throttled request is NOT an observation (B-THROTTLE)
 
 
 def ohlcv(net, pool, tf, before_s, limit, lo_s):
@@ -71,6 +74,10 @@ def ohlcv(net, pool, tf, before_s, limit, lo_s):
         d = gt(f"/networks/{net}/pools/{pool}/ohlcv/{tf}?aggregate=1&before_timestamp={before}&limit={limit}&currency=token")
         if d is None:
             return None
+        if d.get("_429"):
+            return "429"
+        if d.get("_401"):
+            return "401"
         if d.get("_404"):
             return "404"
         lst = (d.get("data") or {}).get("attributes", {}).get("ohlcv_list") or []
@@ -110,6 +117,10 @@ def process(ev):
         if m == "404" and not tried_resolve:
             pool = None
             continue
+        if m == "429":
+            return None, []                        # leave bars_status NULL: retry later, never record a throttle
+        if m == "401":
+            return "too_old", []
         if m is None or m == "404":
             return "failed" if m is None else "no_pool", []
         time.sleep(SLEEP)
@@ -139,7 +150,11 @@ def main():
                 break
             status, rows = process(ev)
             STATS["events"] += 1
-            STATS[status] += 1
+            if status is None:
+                log(f"{ev['chain']} {ev['token'][:10]} throttled; backing off 120 s, event left for retry")
+                time.sleep(120)
+                continue
+            STATS[status] = STATS.get(status, 0) + 1
             if rows:
                 for i in range(0, len(rows), 500):
                     st2, body = sb("POST", "/boost_bars?on_conflict=event_id,res,ts", rows[i:i + 500], prefer="resolution=merge-duplicates,return=minimal")

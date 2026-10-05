@@ -60,6 +60,8 @@ def dist(name, xs, d=2):
 
 def main():
     ev = keyset("boost_events", "*", "event_id")
+    print("NOTE kind=profile: paymentTimestamp is the PAYMENT, publication is a later manual approval (minutes-hours),")
+    print("     so profile latencies are not trigger latencies; only boosts publish at payment. Treat profile as a covariate.")
     print(f"events {len(ev)}  by population/kind/chain:")
     for k, n in sorted(collections.Counter((e['population'] or 'live', e['kind'], e['chain']) for e in ev).items()):
         print(f"   {k}: {n}")

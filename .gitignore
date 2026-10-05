@@ -5,3 +5,4 @@ seed_sources.sql
 __pycache__/
 *.pyc
 _setup_private.sql
+boost_out/

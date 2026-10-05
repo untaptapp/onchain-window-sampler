@@ -1,0 +1,36 @@
+name: boost-tape
+
+# DexScreener BOOST window sampler — the on-chain tape around every Solana boost payment
+# (research/dex-paid-signal.md). Long-lived websocket (wss://api.dexscreener.com/token-boosts/latest/v1)
+# with a REST fallback; Helius parsed-tx pull per event after the post-window; DexScreener follow-ups
+# at 5m/15m/1h/6h/24h. `seen_at` (our feed latency) cannot be backfilled, so cancel-in-progress is
+# TRUE: every cron slot restarts fresh instead of risking a dropped pending run (C-CRON).
+on:
+  schedule:
+    - cron: '7 */5 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: boost-tape
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: deps
+        run: pip install --quiet websockets
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          HELIUS_KEY: ${{ secrets.HELIUS_KEY }}
+          CHAIN: solana
+          RUN_SECONDS: '18000'
+          HELIUS_BUDGET: '3000'
+        run: python boost_tape.py

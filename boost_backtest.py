@@ -106,7 +106,7 @@ def main():
         ids = [e["event_id"] for e in tape if e["kind"] == "boost"]
         legs = keyset("boost_trades", "event_id,slot,ts,wallet,side,sol_amt,tip,fee,programs,marker,source", "event_id,sig",
                       "&side=eq.buy") if ids else []
-        pay = {e["event_id"]: e["payment_ts"] / 1000 for e in tape}
+        pay = {e["event_id"]: e["payment_ts"] / 1000 for e in tape if e["kind"] == "boost"}   # boosts only: a profile's payment is not its publication
         first60 = [l for l in legs if l["event_id"] in pay and 0 <= l["ts"] - pay[l["event_id"]] <= 60]
         print(f"  first-60s buy legs {len(first60)} across {len({l['event_id'] for l in first60})} events, {len({l['wallet'] for l in first60})} wallets")
         per_w = collections.defaultdict(list)

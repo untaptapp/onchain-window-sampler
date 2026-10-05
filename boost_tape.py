@@ -513,8 +513,8 @@ def summarise(ev, legs, n_tx, n_failed, complete):
                     first_cluster = ls[0]["ts"] - pay
     fb = post[0] if (post and post[0]["side"] == "buy") else next((l for l in post if l["side"] == "buy"), None)
 
-    def px_at(h):
-        c = [l for l in post if l["ts"] <= pay + h and l["fill_price"]]
+    def px_at(h):   # reference prices from real-size fills only — a dust print is a quote artifact (D-PRINT)
+        c = [l for l in post if l["ts"] <= pay + h and l["fill_price"] and l["sol_amt"] >= 0.01]
         return c[-1]["fill_price"] if c else None
 
     r = ev.row
@@ -526,7 +526,8 @@ def summarise(ev, legs, n_tx, n_failed, complete):
              sol_in_180=round(sum(l["sol_amt"] for l in buys180), 4), sol_out_180=round(sum(l["sol_amt"] for l in sells180), 4),
              clusters_60=clusters, first_cluster_lag_s=(round(first_cluster, 3) if first_cluster is not None else None),
              tipped_60=sum(1 for l in buys60 if l["tip"] > 0), max_tip_60=(max([l["tip"] for l in buys60], default=0)),
-             marker_60=sum(1 for l in buys60 if l["marker"]), price_pre=(pre[-1]["fill_price"] if pre else None),
+             marker_60=sum(1 for l in buys60 if l["marker"]),
+             price_pre=next((l["fill_price"] for l in reversed(pre) if l["fill_price"] and l["sol_amt"] >= 0.01), None),
              price_60=px_at(60), price_180=px_at(180), helius_calls=helius_calls)
 
 

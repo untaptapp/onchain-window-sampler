@@ -21,6 +21,7 @@ SLEEP = float(os.environ.get("SLEEP", "11"))
 HOUR_H = int(os.environ.get("HOUR_H", "48"))
 MIN_PRE = int(os.environ.get("MIN_PRE", "30"))
 MIN_POST = int(os.environ.get("MIN_POST", "180"))
+ORDER = os.environ.get("ORDER", "asc")   # a second drain from another IP runs desc so the two never collide
 NETWORK = {"solana": "solana", "ethereum": "eth", "base": "base", "bsc": "bsc", "robinhood": "robinhood", "arc": "arc"}
 GT = "https://api.geckoterminal.com/api/v2"
 STATS = {"events": 0, "done": 0, "no_pool": 0, "failed": 0, "gt_calls": 0, "gt_429": 0, "rows": 0}
@@ -126,7 +127,7 @@ def main():
     while time.time() < end:
         cutoff = int((time.time() - MIN_POST * 60 - 300) * 1000)
         st, evs = sb("GET", f"/boost_events?select=event_id,chain,token,payment_ts,pair_address&bars_status=is.null"
-                            f"&payment_ts=lte.{cutoff}&order=payment_ts.asc&limit=50")
+                            f"&payment_ts=lte.{cutoff}&order=payment_ts.{ORDER}&limit=50")
         if st != 200:
             raise RuntimeError(f"queue read failed {st} {evs}")
         if not evs:

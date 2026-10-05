@@ -1,0 +1,31 @@
+name: boost-bars
+
+# GeckoTerminal price path (minute -30m..+3h, hour ..+48h) for every paid-signal event in boost_events,
+# live or backfilled (research/dex-paid-signal.md). Keyless GT sustains ~5-6 req/min, so this is a slow
+# self-polling drain: oldest unfilled events first, only once their +3h window has elapsed. Resumable
+# (each event is marked done/no_pool/failed), so cancel-in-progress stays false.
+on:
+  schedule:
+    - cron: '23 */2 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: boost-bars
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          RUN_SECONDS: '6900'
+          SLEEP: '11'
+        run: python boost_bars.py

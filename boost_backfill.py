@@ -26,7 +26,7 @@ import os, sys, time, json, random, math, collections, urllib.parse
 os.environ.setdefault("SINK", "supabase")
 import boost_tape as bt   # reuses http_json, sb, Sink, tx_to_legs, summarise, Event, templates, TIP_ACCOUNTS
 
-SAMPLE = {"pump_launch": int(os.environ.get("SAMPLE_PUMP", "3000")),
+SAMPLE = {"recent_board": int(os.environ.get("SAMPLE_RECENT", "2000")), "pump_launch": int(os.environ.get("SAMPLE_PUMP", "3000")),
           "trending": int(os.environ.get("SAMPLE_TRENDING", "1500")),
           "rh_launch": int(os.environ.get("SAMPLE_RH", "1000"))}
 POPULATIONS = [p for p in os.environ.get("POPULATIONS", "pump_launch,trending,rh_launch").split(",") if p]
@@ -34,7 +34,7 @@ SIG_PAGES = int(os.environ.get("SIG_PAGES", "30"))
 TAPE_MAX_AGE_D = float(os.environ.get("TAPE_MAX_AGE_D", "7"))   # older events: recorded, no tape (each too_deep burns SIG_PAGES calls)
 ORDERS_RPM = int(os.environ.get("ORDERS_RPM", "55"))
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "20000"))
-CHAIN_OF = {"pump_launch": "solana", "trending": "solana", "rh_launch": "robinhood"}
+CHAIN_OF = {"pump_launch": "solana", "trending": "solana", "rh_launch": "robinhood", "recent_board": "solana"}
 T_END = time.time() + RUN_SECONDS
 log = bt.log
 
@@ -77,6 +77,10 @@ def population(name):
             return pg_sample(f"select mint, null, pool_address from trending_pools tablesample system (2) where ok order by random() limit {n}")
         if name == "rh_launch":
             return pg_sample(f"select mint, first_seen_at, null from rh_launches tablesample system (1) order by random() limit {n}")
+        if name == "recent_board":   # Solana mints with minute bars ending in the last 10 days (board cases + controls)
+            lo = int(time.time()) - 10 * 86400
+            return pg_sample(f"select c.mint, null, p.pool_address from trending_bar_cov c left join trending_pools p on p.mint=c.mint "
+                             f"where c.mint not like '0x%%' and c.ts_to >= {lo} order by random() limit {n}")
     if name == "pump_launch":
         lo = int(time.time()) - 5 * 86400
         rows = sb_keyset("pump_launches", "mint,created_at,bonding_curve", f"&created_at=gte.{lo}")

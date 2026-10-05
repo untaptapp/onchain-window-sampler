@@ -30,7 +30,9 @@ DESIGN NOTES (guardrails, learned here)
   in `channel`, so latency statistics are never pooled across channels.
 - The socket handshake is a 90-item SNAPSHOT, not events — it seeds the dedupe set and is never
   written. Heartbeats are ignored.
-- Multi-chain feed: only `chainId == CHAIN` is ever written (fail closed, like SOL_SOURCES).
+- Multi-chain feed: only `chainId in CHAINS` is ever written (fail closed, like SOL_SOURCES); the
+  on-chain tape decoder exists for `TAPE_CHAINS` (solana) — other chains get events + follow-ups and
+  `tape_status='no_tape_chain'`, so a missing tape is a labelled fact, not an empty market.
 - Event identity is (token, paymentTimestamp) from `orders/v1`, not the feed item — a token can be
   boosted repeatedly and the feed can deliver an item twice.
 - The tape is pulled AFTER the post-window has elapsed, from Helius' parsed-transaction API on
@@ -49,7 +51,7 @@ DESIGN NOTES (guardrails, learned here)
   `--load-jsonl DIR` replays such files into Supabase.
 
 Env: SUPABASE_URL, SUPABASE_KEY (or SINK=jsonl + OUT_DIR), HELIUS_KEY (HELIUS_FREE_KEY accepted),
-     CHAIN=solana, RUN_SECONDS=20000, PRE_S=120, POST_S=180, TAPE_DELAY_S=60, MAX_PAGES=8,
+     CHAINS=solana,bsc,base,ethereum,robinhood,arc (events + follow-ups for all; tape for solana only), RUN_SECONDS=20000, PRE_S=120, POST_S=180, TAPE_DELAY_S=60, MAX_PAGES=8,
      HELIUS_BUDGET=3000, FOLLOWUPS=300,900,3600,21600,86400, REST_POLL_S=30.
 """
 import asyncio, json, os, sys, time, random, collections, datetime, urllib.request, urllib.error, urllib.parse
@@ -59,7 +61,9 @@ try:
 except ImportError:
     raise SystemExit("pip install websockets")
 
-CHAIN = os.environ.get("CHAIN", "solana")
+CHAINS = [c.strip() for c in os.environ.get("CHAINS", os.environ.get("CHAIN", "solana")).split(",") if c.strip()]
+TAPE_CHAINS = {"solana"}   # on-chain tape decoder exists for these; other chains get events + follow-ups only
+CHAIN = CHAINS[0]          # legacy single-chain name used in log lines
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "20000"))
 PRE_S = int(os.environ.get("PRE_S", "120"))
 POST_S = int(os.environ.get("POST_S", "180"))
@@ -182,12 +186,12 @@ class Sink:
         if SINK != "supabase":
             return set(), {}
         ids, done = set(), {}
-        st, rows = sb("GET", f"/boost_events?select=event_id,payment_ts,tape_status&chain=eq.{CHAIN}"
+        st, rows = sb("GET", f"/boost_events?select=event_id,payment_ts,tape_status&chain=in.({','.join(CHAINS)})"
                              f"&payment_ts=gte.{int(since_s * 1000)}&order=event_id.asc&limit=1000")
         if st == 200:
             for r in rows:
                 ids.add(r["event_id"])
-            st2, fu = sb("GET", f"/boost_followups?select=event_id,horizon_s&chain=eq.{CHAIN}"
+            st2, fu = sb("GET", f"/boost_followups?select=event_id,horizon_s&chain=in.({','.join(CHAINS)})"
                                 f"&ts=gte.{int(since_s)}&order=event_id.asc,horizon_s.asc&limit=1000")
             if st2 == 200:
                 for r in fu:
@@ -202,16 +206,16 @@ class Sink:
 SINK_OBJ = Sink()
 
 # ----------------------------------------------------------------------------- dexscreener
-def ds_orders(token):
-    st, d = http_json(f"{DS}/orders/v1/{CHAIN}/{token}")
+def ds_orders(chain, token):
+    st, d = http_json(f"{DS}/orders/v1/{chain}/{token}")
     if st != 200 or not isinstance(d, dict):
         STATS["orders_fail"] += 1
         return None
     return d
 
 
-def ds_pairs(tokens):
-    """Returns {token: best pair dict} — the deepest pair per token. Missing 'pairs' = FAILURE (B-DEX)."""
+def ds_pairs(chain, tokens):
+    """Returns {token: best pair dict} — the deepest pair per token on `chain`. Missing 'pairs' = FAILURE (B-DEX)."""
     out = {}
     for i in range(0, len(tokens), 30):
         st, d = http_json(f"{DS}/latest/dex/tokens/{','.join(tokens[i:i + 30])}")
@@ -219,7 +223,7 @@ def ds_pairs(tokens):
             STATS["pairs_fail"] += 1
             continue
         for p in d["pairs"] or []:
-            if p.get("chainId") != CHAIN:
+            if p.get("chainId") != chain:
                 continue
             t = p["baseToken"]["address"]
             if t not in tokens[i:i + 30]:
@@ -239,7 +243,7 @@ def fnum(x):
 
 # ----------------------------------------------------------------------------- event bookkeeping
 class Event:
-    __slots__ = ("event_id", "token", "amount", "total", "channel", "seen_at", "payment_ts", "pair",
+    __slots__ = ("event_id", "chain", "token", "amount", "total", "channel", "seen_at", "payment_ts", "pair",
                  "dex", "tape_status", "followups_done", "row")
 
     def __init__(self, **kw):
@@ -253,7 +257,7 @@ QUEUE = asyncio.Queue()
 
 
 def event_row_template():
-    return dict(event_id=None, chain=CHAIN, token=None, amount=None, total_amount=None, channel=None,
+    return dict(event_id=None, chain=None, token=None, amount=None, total_amount=None, channel=None,
                 seen_at=None, payment_ts=None, our_lag_ms=None, pair_address=None, dex_id=None,
                 pair_created_at=None, pair_age_s=None, price_usd=None, price_native=None, mcap_usd=None,
                 liquidity_usd=None, vol_h1=None, buys_m5=None, sells_m5=None, profile_status=None,
@@ -267,13 +271,13 @@ def event_row_template():
 
 async def handle_item(item, channel, seen_at):
     """A boost feed item → an Event row (idempotent on (token, paymentTimestamp))."""
-    token, amount = item.get("tokenAddress"), item.get("amount")
-    key = (token, amount)
+    chain, token, amount = item.get("chainId"), item.get("tokenAddress"), item.get("amount")
+    key = (chain, token, amount)
     if key in SEEN_ITEMS:
         return
     SEEN_ITEMS.add(key)
     loop = asyncio.get_running_loop()
-    orders = await loop.run_in_executor(None, ds_orders, token)
+    orders = await loop.run_in_executor(None, ds_orders, chain, token)
     if orders is None:
         log("orders lookup failed; event dropped (counted)", token)
         STATS["event_dropped_no_orders"] += 1
@@ -285,15 +289,15 @@ async def handle_item(item, channel, seen_at):
         log("feed item without a boost record in orders/v1", token, amount)
         return
     pay = max(b["paymentTimestamp"] for b in boosts)
-    event_id = f"{token}:{pay}"
+    event_id = f"{chain}:{token}:{pay}" if chain != "solana" else f"{token}:{pay}"
     if event_id in EVENTS or event_id in KNOWN_IDS:
         STATS["dup_event"] += 1
         return
     prof = [o for o in orders.get("orders", []) if o.get("type") == "tokenProfile"]
-    pairs = await loop.run_in_executor(None, ds_pairs, [token])
+    pairs = await loop.run_in_executor(None, ds_pairs, chain, [token])
     p = pairs.get(token) or {}
     row = event_row_template()
-    row.update(event_id=event_id, token=token, amount=amount, total_amount=item.get("totalAmount"),
+    row.update(event_id=event_id, chain=chain, token=token, amount=amount, total_amount=item.get("totalAmount"),
                channel=channel, seen_at=int(seen_at * 1000), payment_ts=pay,
                our_lag_ms=int(seen_at * 1000 - pay), pair_address=p.get("pairAddress"), dex_id=p.get("dexId"),
                pair_created_at=p.get("pairCreatedAt"),
@@ -305,13 +309,14 @@ async def handle_item(item, channel, seen_at):
                profile_status=(prof[-1]["status"] if prof else None),
                profile_paid_ts=(max(o["paymentTimestamp"] for o in prof) if prof else None),
                n_prior_boosts=sum(1 for b in orders.get("boosts", []) if b["paymentTimestamp"] < pay),
-               tape_status="pending" if p.get("pairAddress") else "no_pair", created_at=int(time.time()))
-    ev = Event(event_id=event_id, token=token, amount=amount, total=item.get("totalAmount"), channel=channel,
+               tape_status=("pending" if p.get("pairAddress") else "no_pair") if chain in TAPE_CHAINS else "no_tape_chain",
+               created_at=int(time.time()))
+    ev = Event(event_id=event_id, chain=chain, token=token, amount=amount, total=item.get("totalAmount"), channel=channel,
                seen_at=seen_at, payment_ts=pay, pair=p.get("pairAddress"), dex=p.get("dexId"),
                tape_status=row["tape_status"], followups_done=set(), row=row)
     EVENTS[event_id] = ev
     STATS["events"] += 1
-    log(f"EVENT {channel} {token[:10]} x{amount} lag {row['our_lag_ms']} ms dex {row['dex_id']} "
+    log(f"EVENT {channel} {chain} {token[:10]} x{amount} lag {row['our_lag_ms']} ms dex {row['dex_id']} "
         f"mcap {row['mcap_usd']} liq {row['liquidity_usd']} pair_age_s {row['pair_age_s']}")
     SINK_OBJ.write("boost_events", [row], "event_id")
 
@@ -335,7 +340,7 @@ async def ws_task():
                         continue
                     if isinstance(d, dict) and "data" in d:          # handshake snapshot = baseline
                         for x in d["data"]:
-                            SEEN_ITEMS.add((x.get("tokenAddress"), x.get("amount")))
+                            SEEN_ITEMS.add((x.get("chainId"), x.get("tokenAddress"), x.get("amount")))
                         log(f"ws handshake {len(d['data'])} items seeded")
                         continue
                     if isinstance(d, dict) and d.get("type") == "heartbeat":
@@ -343,7 +348,7 @@ async def ws_task():
                     items = d if isinstance(d, list) else ([d] if isinstance(d, dict) and "tokenAddress" in d
                                                             else (d.get("data") if isinstance(d, dict) else []) or [])
                     for x in items:
-                        if isinstance(x, dict) and x.get("chainId") == CHAIN:
+                        if isinstance(x, dict) and x.get("chainId") in CHAINS:
                             STATS["ws_items"] += 1
                             asyncio.create_task(handle_item(x, "ws", now))
                         else:
@@ -366,9 +371,9 @@ async def rest_task():
         now = time.time()
         if st == 200 and isinstance(d, list):
             for x in d:
-                if x.get("chainId") != CHAIN:
+                if x.get("chainId") not in CHAINS:
                     continue
-                key = (x.get("tokenAddress"), x.get("amount"))
+                key = (x.get("chainId"), x.get("tokenAddress"), x.get("amount"))
                 if first:
                     SEEN_ITEMS.add(key)
                 elif key not in SEEN_ITEMS:
@@ -444,7 +449,7 @@ def count_failed(address, lo_s, hi_s):
     return n_fail if covered else None
 
 
-def tx_to_legs(t, token, event_id):
+def tx_to_legs(t, token, event_id, chain="solana"):
     """One parsed tx → token legs for `token` with executed-fill economics."""
     if t.get("transactionError"):
         return []
@@ -467,7 +472,7 @@ def tx_to_legs(t, token, event_id):
         return []
     side = "buy" if net > 0 else "sell"
     sol = abs(payer_dsol) - (t.get("fee", 0) / 1e9 if side == "buy" else 0)  # SOL moved for the swap (incl. tip)
-    legs.append(dict(event_id=event_id, chain=CHAIN, sig=t["signature"], slot=t["slot"], ts=t["timestamp"],
+    legs.append(dict(event_id=event_id, chain=chain, sig=t["signature"], slot=t["slot"], ts=t["timestamp"],
                      wallet=payer, side=side, token_amt=abs(net), sol_amt=round(sol, 9),
                      fill_price=(sol / abs(net)) if net else None, tip=round(tip, 9), fee=t.get("fee", 0) / 1e9,
                      programs=sorted(progs)[:6], marker=(sorted(markers)[0] if markers else None),
@@ -533,7 +538,7 @@ async def tape_task():
             txs, complete = await loop.run_in_executor(None, helius_pages, ev.pair, lo, hi)
             legs = []
             for t in txs:
-                legs += tx_to_legs(t, ev.token, ev.event_id)
+                legs += tx_to_legs(t, ev.token, ev.event_id, ev.chain)
             n_failed = await loop.run_in_executor(None, count_failed, ev.pair, lo, hi)
             summarise(ev, legs, len(txs), n_failed, complete)
             ev.tape_status = "done"
@@ -556,9 +561,13 @@ async def followup_task():
             for h in FOLLOWUPS:
                 if h not in ev.followups_done and now >= ev.payment_ts / 1000 + h:
                     due[h].append(ev)
-        for h, evs in due.items():
+        for h, evs0 in due.items():
+          by_chain = collections.defaultdict(list)
+          for e in evs0:
+              by_chain[e.chain].append(e)
+          for chain, evs in by_chain.items():
             tokens = list({e.token for e in evs})
-            pairs = await loop.run_in_executor(None, ds_pairs, tokens)
+            pairs = await loop.run_in_executor(None, ds_pairs, chain, tokens)
             ts = int(time.time())
             rows = []
             for e in evs:
@@ -567,7 +576,7 @@ async def followup_task():
                     STATS["followup_missing"] += 1   # token no longer has pairs, or the call failed (counted)
                     e.followups_done.add(h)
                     continue
-                rows.append(dict(event_id=e.event_id, chain=CHAIN, horizon_s=h, ts=ts,
+                rows.append(dict(event_id=e.event_id, chain=e.chain, horizon_s=h, ts=ts,
                                  pair_address=p.get("pairAddress"), dex_id=p.get("dexId"),
                                  price_usd=fnum(p.get("priceUsd")), price_native=fnum(p.get("priceNative")),
                                  mcap_usd=fnum(p.get("marketCap") or p.get("fdv")),
@@ -597,21 +606,21 @@ async def main():
     KNOWN_IDS, done = SINK_OBJ.existing_event_ids(time.time() - max(FOLLOWUPS) - 3600)
     # Resume follow-ups for recent events written by earlier runs (supabase only).
     if SINK == "supabase" and KNOWN_IDS:
-        st, rows = sb("GET", f"/boost_events?select=event_id,token,amount,total_amount,channel,seen_at,payment_ts,pair_address,dex_id,tape_status"
-                             f"&chain=eq.{CHAIN}&payment_ts=gte.{int((time.time() - max(FOLLOWUPS) - 3600) * 1000)}&order=event_id.asc&limit=1000")
+        st, rows = sb("GET", f"/boost_events?select=event_id,chain,token,amount,total_amount,channel,seen_at,payment_ts,pair_address,dex_id,tape_status"
+                             f"&chain=in.({','.join(CHAINS)})&payment_ts=gte.{int((time.time() - max(FOLLOWUPS) - 3600) * 1000)}&order=event_id.asc&limit=1000")
         if st == 200:
             for r in rows:
-                ev = Event(event_id=r["event_id"], token=r["token"], amount=r["amount"], total=r["total_amount"],
+                ev = Event(event_id=r["event_id"], chain=r["chain"], token=r["token"], amount=r["amount"], total=r["total_amount"],
                            channel=r["channel"], seen_at=r["seen_at"] / 1000, payment_ts=r["payment_ts"], pair=r["pair_address"],
                            dex=r["dex_id"], tape_status=("resumed" if r["tape_status"] != "pending" else "pending"),
                            followups_done=set(done.get(r["event_id"], set())), row=None)
                 if ev.tape_status == "pending":
                     ev.row = event_row_template()
                     ev.row.update({k: r[k] for k in r})
-                    ev.row["chain"] = CHAIN
+                    ev.row["chain"] = r["chain"]
                 EVENTS[ev.event_id] = ev
             log(f"resumed {len(rows)} recent events for follow-ups")
-    log(f"start sink={SINK} chain={CHAIN} run={RUN_SECONDS}s pre={PRE_S} post={POST_S} budget={HELIUS_BUDGET} known={len(KNOWN_IDS)}")
+    log(f"start sink={SINK} chains={CHAINS} run={RUN_SECONDS}s pre={PRE_S} post={POST_S} budget={HELIUS_BUDGET} known={len(KNOWN_IDS)}")
     tasks = [asyncio.create_task(c()) for c in (ws_task, rest_task, tape_task, followup_task, summary_task)]
     try:
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=RUN_SECONDS)

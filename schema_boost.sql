@@ -107,3 +107,17 @@ alter table boost_followups enable row level security;
 -- Retention: boost_trades is the only table that grows meaningfully (~≤800 rows/event). At ~150
 -- Solana boosts/day that is ≤30 MB/day worst case; add a prune once the first month is in.
 -- After applying: notify pgrst, 'reload schema';
+
+-- Minute/hour price path per event from GeckoTerminal OHLCV (boost_bars.py): per-POOL candles
+-- (B2), minute from -30 min to +3 h and hour to +48 h. `res` = 'm' | 'h'. Backfillable, so a
+-- backfill event gets the same path a live one does. ts is epoch SECONDS (bar open).
+create table if not exists boost_bars (
+  event_id  text not null references boost_events(event_id) on delete cascade,
+  pool      text not null,
+  res       text not null,
+  ts        bigint not null,
+  o double precision, h double precision, l double precision, c double precision, v double precision,
+  primary key (event_id, res, ts)
+);
+alter table boost_bars enable row level security;
+alter table boost_events add column if not exists bars_status text;   -- null | done | no_pool | failed

@@ -30,7 +30,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           HELIUS_KEY: ${{ secrets.HELIUS_KEY }}
-          CHAIN: solana
+          CHAINS: solana,bsc,base,ethereum,robinhood,arc
           RUN_SECONDS: '18000'
           HELIUS_BUDGET: '3000'
         run: python boost_tape.py

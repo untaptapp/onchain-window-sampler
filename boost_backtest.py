@@ -103,11 +103,11 @@ def main():
             ahead = sum(1 for e in g if e["our_lag_ms"] / 1000 < e["first_buy_lag_s"])
             print(f"  live events where our ws lag < first on-chain buy lag: {ahead}/{len(g)} ({100*ahead/len(g):.0f}%) — a necessary, not sufficient, condition")
         print("\n== Q3/Q4 wallets and config in the first 60 s after a BOOST")
-        ids = [e["event_id"] for e in tape if e["kind"] == "boost"]
-        legs = keyset("boost_trades", "event_id,slot,ts,wallet,side,sol_amt,tip,fee,programs,marker,source", "event_id,sig",
-                      "&side=eq.buy") if ids else []
         pay = {e["event_id"]: e["payment_ts"] / 1000 for e in tape if e["kind"] == "boost"}   # boosts only: a profile's payment is not its publication
-        first60 = [l for l in legs if l["event_id"] in pay and 0 <= l["ts"] - pay[l["event_id"]] <= 60]
+        first60 = []
+        for eid, p0 in pay.items():   # one small windowed call per boost event instead of paging the whole table
+            first60 += sb_get(f"/boost_trades?select=event_id,slot,ts,wallet,side,sol_amt,tip,fee,programs,marker,source"
+                              f"&event_id=eq.{urllib.parse.quote(eid)}&side=eq.buy&ts=gte.{int(p0)}&ts=lte.{int(p0)+60}&limit=2000")
         print(f"  first-60s buy legs {len(first60)} across {len({l['event_id'] for l in first60})} events, {len({l['wallet'] for l in first60})} wallets")
         per_w = collections.defaultdict(list)
         for l in first60:

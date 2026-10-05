@@ -31,6 +31,7 @@ SAMPLE = {"pump_launch": int(os.environ.get("SAMPLE_PUMP", "3000")),
           "rh_launch": int(os.environ.get("SAMPLE_RH", "1000"))}
 POPULATIONS = [p for p in os.environ.get("POPULATIONS", "pump_launch,trending,rh_launch").split(",") if p]
 SIG_PAGES = int(os.environ.get("SIG_PAGES", "30"))
+TAPE_MAX_AGE_D = float(os.environ.get("TAPE_MAX_AGE_D", "7"))   # older events: recorded, no tape (each too_deep burns SIG_PAGES calls)
 ORDERS_RPM = int(os.environ.get("ORDERS_RPM", "55"))
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "20000"))
 CHAIN_OF = {"pump_launch": "solana", "trending": "solana", "rh_launch": "robinhood"}
@@ -71,21 +72,21 @@ def population(name):
         n = SAMPLE[name] * 2
         if name == "pump_launch":
             lo = int(time.time()) - 5 * 86400
-            return pg_sample(f"select mint, created_at from pump_launches where created_at >= {lo} order by random() limit {n}")
+            return pg_sample(f"select mint, created_at, bonding_curve from pump_launches where created_at >= {lo} order by random() limit {n}")
         if name == "trending":
-            return pg_sample(f"select mint, null from trending_pools tablesample system (2) where ok order by random() limit {n}")
+            return pg_sample(f"select mint, null, pool_address from trending_pools tablesample system (2) where ok order by random() limit {n}")
         if name == "rh_launch":
-            return pg_sample(f"select mint, first_seen_at from rh_launches tablesample system (1) order by random() limit {n}")
+            return pg_sample(f"select mint, first_seen_at, null from rh_launches tablesample system (1) order by random() limit {n}")
     if name == "pump_launch":
         lo = int(time.time()) - 5 * 86400
-        rows = sb_keyset("pump_launches", "mint,created_at", f"&created_at=gte.{lo}")
-        return [(r["mint"], r["created_at"]) for r in rows]
+        rows = sb_keyset("pump_launches", "mint,created_at,bonding_curve", f"&created_at=gte.{lo}")
+        return [(r["mint"], r["created_at"], r["bonding_curve"]) for r in rows]
     if name == "trending":
-        rows = sb_keyset("trending_pools", "mint,resolved_at", "")
-        return [(r["mint"], None) for r in rows]
+        rows = sb_keyset("trending_pools", "mint,pool_address", "&ok=is.true")
+        return [(r["mint"], None, r["pool_address"]) for r in rows]
     if name == "rh_launch":
         rows = sb_keyset("rh_launches", "mint,first_seen_at", "")
-        return [(r["mint"], r["first_seen_at"]) for r in rows]
+        return [(r["mint"], r["first_seen_at"], None) for r in rows]
     raise ValueError(name)
 
 
@@ -172,7 +173,7 @@ def scan(pop, items, known):
         items = random.sample(items, SAMPLE[pop])
     log(f"{pop}: scanning {len(items)} tokens on {chain} (orders at {ORDERS_RPM}/min ≈ {len(items) / ORDERS_RPM:.0f} min)")
     n_ev, n_tok_hit = 0, 0
-    for i, (token, born) in enumerate(items):
+    for i, (token, born, fallback_pool) in enumerate(items):
         if time.time() > T_END:
             log("RUN_SECONDS reached mid-scan")
             break
@@ -187,6 +188,11 @@ def scan(pop, items, known):
             pairs = bt.ds_pairs(chain, [token])
             p = pairs.get(token) or {}
             prof = [x for x in o.get("orders", []) if x.get("type") == "tokenProfile"]
+            pair_src = "dexscreener"
+            if not p.get("pairAddress") and fallback_pool:
+                p = dict(p, pairAddress=fallback_pool, dexId=(p.get("dexId") or "pumpfun-curve" if pop == "pump_launch" else "gt-pool"))
+                pair_src = "fallback"
+                bt.STATS["pair_fallback"] += 1
             for kind, pay, amount in events:
                 eid = (f"{token}:{pay}" if kind == "boost" else f"{token}:p{pay}") if chain == "solana" else \
                       (f"{chain}:{token}:{pay}" if kind == "boost" else f"{chain}:{token}:p{pay}")
@@ -206,6 +212,9 @@ def scan(pop, items, known):
                 ev = bt.Event(event_id=eid, chain=chain, token=token, amount=amount, total=None, channel="backfill",
                               seen_at=pay / 1000, payment_ts=pay, pair=p.get("pairAddress"), dex=p.get("dexId"),
                               tape_status=row["tape_status"], followups_done=set(), row=row)
+                if ev.tape_status == "pending" and time.time() - pay / 1000 > TAPE_MAX_AGE_D * 86400:
+                    ev.tape_status = "too_old"
+                    row["tape_status"] = "too_old"
                 legs = tape_for(ev) if ev.tape_status == "pending" else []
                 bt.SINK_OBJ.write("boost_trades", legs, "event_id,sig,wallet,side")
                 bt.SINK_OBJ.write("boost_events", [row], "event_id")

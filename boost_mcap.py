@@ -102,7 +102,7 @@ def sol_usd_series():
 def _sol_usd_fetch():
     pool = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"   # Raydium SOL/USDC
     out, before = {}, int(time.time())
-    for _ in range(2):
+    for _ in range(3):
         d = get(f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool}/ohlcv/hour?aggregate=1&limit=1000&before_timestamp={before}")
         lst = d["data"]["attributes"]["ohlcv_list"]
         for r in lst:
@@ -149,7 +149,8 @@ def main():
         c.execute("set statement_timeout='300s'")
         ev = c.execute("""select event_id, token, payment_ts, created_at, channel, population, pair_age_s, mcap_usd, tape_status,
                                  buys_60, wallets_60, sol_in_60, clusters_60, tipped_60, marker_60, dex_id, amount, n_prior_boosts, profile_paid_ts
-                          from boost_events where kind='boost' and chain='solana' and bars_status='done'""").fetchall()
+                          from boost_events where kind='boost' and chain='solana' and bars_status='done'
+                            and payment_ts >= (extract(epoch from now()) - 175*86400) * 1000""").fetchall()
         cols = ["event_id", "token", "payment_ts", "created_at", "channel", "population", "pair_age_s", "mcap_snap", "tape_status",
                 "buys_60", "wallets_60", "sol_in_60", "clusters_60", "tipped_60", "marker_60", "dex_id", "amount", "n_prior_boosts", "profile_paid_ts"]
         ev = [dict(zip(cols, r)) for r in ev]
@@ -292,7 +293,10 @@ def main():
         path = [x for x in m if x[0] >= t0 and x[0] + 60 <= t0 + H] + [x for x in hb if x[0] >= P + 10800 and x[0] + 3600 <= t0 + H]
         tgt = None
         if tp is not None:
-            tgt = (tp / mc(1.0, t0)) if tp > 50 else px0 * tp   # absolute USD mcap -> price, or multiple
+            unit = mc(1.0, t0)
+            if tp > 50 and not unit:
+                return None
+            tgt = (tp / unit) if tp > 50 else px0 * tp   # absolute USD mcap -> price, or multiple
         for x in path:
             if sl is not None and x[3] <= px0 * (1 - sl):
                 return (1 - sl) - 1
